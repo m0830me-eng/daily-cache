@@ -2,6 +2,15 @@ name: CGV Yongsan Auto Speed Test
 
 on:
   workflow_dispatch:
+  schedule:
+    # KST 06:02
+    - cron: "2 21 * * *"
+    # KST 11:32
+    - cron: "32 2 * * *"
+    # KST 17:02
+    - cron: "2 8 * * *"
+    # KST 22:32
+    - cron: "32 13 * * *"
 
 permissions:
   contents: write
@@ -13,7 +22,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 350
 
     steps:
       - name: Checkout
@@ -29,11 +38,37 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Set monitoring duration
+        id: duration
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "seconds=120" >> "$GITHUB_OUTPUT"
+          else
+            case "${{ github.event.schedule }}" in
+              "2 21 * * *")
+                echo "seconds=19800" >> "$GITHUB_OUTPUT"
+                ;;
+              "32 2 * * *")
+                echo "seconds=19800" >> "$GITHUB_OUTPUT"
+                ;;
+              "2 8 * * *")
+                echo "seconds=19800" >> "$GITHUB_OUTPUT"
+                ;;
+              "32 13 * * *")
+                echo "seconds=5220" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "seconds=120" >> "$GITHUB_OUTPUT"
+                ;;
+            esac
+          fi
+
       - name: Run
         env:
           CY_WEBHOOK: ${{ secrets.CY_WEBHOOK }}
           DISCORD_MENTION_ID: ${{ secrets.DISCORD_MENTION_ID }}
-          RUN_SECONDS: "19200"
+          RUN_SECONDS: ${{ steps.duration.outputs.seconds }}
         run: python -u cinema_alert.py
 
       - name: Save state
@@ -42,6 +77,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add seen_cgv_yongsan.json baseline_cgv_yongsan.done 2>/dev/null || true
 
           if git diff --cached --quiet; then
@@ -51,4 +87,3 @@ jobs:
             git pull --rebase
             git push
           fi
-
