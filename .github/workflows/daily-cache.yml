@@ -20,7 +20,7 @@ permissions:
 contents: write
 
 concurrency:
-group: cgv-yongsan-monitor
+group: daily-cache
 cancel-in-progress: false
 
 jobs:
@@ -92,4 +92,3 @@ steps:
         git push
       fi
 ```
-
