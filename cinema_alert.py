@@ -3,6 +3,8 @@ import sys
 import json
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
@@ -22,22 +24,32 @@ KST = ZoneInfo("Asia/Seoul")
 SITE_NO = "0013"
 SITE_NAME = "CGV 용산아이파크몰"
 
-DAYS = 50
+DAYS = 43
 
-# 50일은 그대로 유지하되 날짜 구간별로 조회 주기를 다르게 한다.
-# +0~+4일   : 60초
-# +5~+14일  : 20초 (가장 빠른 핵심 구간)
-# +15~+30일 : 45초
-# +31~+49일 : 300초
+# 오늘 포함 43일(+0~+42일)을 날짜 구간별로 분산 감시한다.
+# +0일(오늘) : 300초
+# +1일(내일) : 20초  (전날 취소표 집중 감시)
+# +2~+4일    : 90초
+# +5~+14일   : 30초
+# +15~+30일  : 60초
+# +31~+42일  : 300초
 # 단, 예매 준비중 또는 매진 상태가 잡힌 날짜는 20초로 승격한다.
-INTERVAL_NEAR = 60.0
-INTERVAL_HOT = 20.0
-INTERVAL_MID = 45.0
+INTERVAL_TODAY = 300.0
+INTERVAL_TOMORROW = 20.0
+INTERVAL_EARLY = 90.0
+INTERVAL_HOT = 30.0
+INTERVAL_MID = 60.0
 INTERVAL_FAR = 300.0
 PRIORITY_INTERVAL = 20.0
 MIN_REQUEST_GAP = 0.35
 RATE_LIMIT_COOLDOWN = 60.0
 SUMMARY_SECONDS = 600.0  # 정상 감시 요약: 10분마다 1회
+
+# 매시 00분 / 30분: +4~+21일(18일) 완전 동시 빠른점검
+FAST_SCAN_MINUTES = {0, 30}
+FAST_SCAN_START_OFFSET = 4
+FAST_SCAN_END_OFFSET = 21
+FAST_SCAN_WORKERS = 18
 START_DELAY = float(os.environ.get("START_DELAY", "0"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "120"))
 
@@ -760,7 +772,7 @@ def collect_full_scan(session, progress=False):
         all_events.update(events)
 
         if progress and index % 10 == 0:
-            print(f"⏳ 기준값 진행: {index}/50 날짜 처리 완료")
+            print(f"⏳ 기준값 진행: {index}/{DAYS} 날짜 처리 완료")
 
     return all_events, None
 
@@ -774,22 +786,22 @@ def initialize_missing_state(session, seen, booking_state, booking_state_ready):
 
     print()
     print("=" * 72)
-    print("INITIAL 50-DAY BASELINE")
+    print(f"INITIAL {DAYS}-DAY BASELINE")
     print("=" * 72)
 
     if need_seen_baseline and need_booking_baseline:
         print(
-            "현재 50일 전체 GV / 무대인사 / IMAX / 4DX와 예매 상태를 "
+            f"현재 {DAYS}일 전체 GV / 무대인사 / IMAX / 4DX와 예매 상태를 "
             "알림 없이 기준값으로 등록합니다."
         )
     elif need_booking_baseline:
         print(
-            "기존 회차 기준값은 유지하고, 현재 50일 전체 예매 상태만 "
+            f"기존 회차 기준값은 유지하고, 현재 {DAYS}일 전체 예매 상태만 "
             "알림 없이 새 기준값으로 등록합니다."
         )
     else:
         print(
-            "현재 50일 전체 GV / 무대인사 / IMAX / 4DX를 "
+            f"현재 {DAYS}일 전체 GV / 무대인사 / IMAX / 4DX를 "
             "알림 없이 기준값으로 등록합니다."
         )
 
@@ -828,8 +840,12 @@ def initialize_missing_state(session, seen, booking_state, booking_state_ready):
 
 
 def base_interval_for_offset(offset):
+    if offset <= 0:
+        return INTERVAL_TODAY
+    if offset == 1:
+        return INTERVAL_TOMORROW
     if offset <= 4:
-        return INTERVAL_NEAR
+        return INTERVAL_EARLY
     if offset <= 14:
         return INTERVAL_HOT
     if offset <= 30:
@@ -888,8 +904,89 @@ def stagger_schedule(dates, booking_state, start_at=None):
     return next_due
 
 
+
+def make_fast_scan_dates():
+    today = now_kst().date()
+    return [
+        (today + timedelta(days=offset)).strftime("%Y%m%d")
+        for offset in range(FAST_SCAN_START_OFFSET, FAST_SCAN_END_OFFSET + 1)
+    ]
+
+
+def run_0030_fast_scan(seen, booking_state, date_event_cache):
+    """
+    매시 00/30분에 +4~+21일 18개 날짜를 동시에 확인한다.
+    - 18 workers
+    - 각 worker는 독립 curl_cffi Session 사용
+    - 상태/Discord 처리는 응답 수집 후 메인 스레드에서 순차 처리
+    - 실패 날짜는 기존 캐시/상태를 절대 덮어쓰지 않는다.
+    """
+    dates = make_fast_scan_dates()
+    barrier = threading.Barrier(len(dates))
+    started = time.monotonic()
+
+    def worker(date):
+        session = requests.Session(impersonate="chrome")
+        try:
+            try:
+                barrier.wait(timeout=10)
+            except threading.BrokenBarrierError:
+                pass
+            events, error = check_one_date(session, date)
+            return date, events, error
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    results = []
+    with ThreadPoolExecutor(max_workers=FAST_SCAN_WORKERS) as executor:
+        futures = [executor.submit(worker, date) for date in dates]
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                results.append(("", None, f"WORKER ERROR | {repr(e)}"))
+
+    elapsed = time.monotonic() - started
+    results.sort(key=lambda item: item[0])
+
+    success = 0
+    errors = 0
+    alerts = 0
+    soldout_changes = 0
+
+    for date, events, error in results:
+        if error or events is None:
+            errors += 1
+            if error:
+                print(f"❌ CGV 00/30 동시스캔 오류 | {error}")
+            continue
+
+        success += 1
+        date_event_cache[date] = events
+
+        for key, event in events.items():
+            a, s = process_event(key, event, seen, booking_state)
+            alerts += a
+            soldout_changes += s
+
+    save_seen(seen)
+    save_booking_state(booking_state)
+
+    icon = "⚡" if errors == 0 else "⚠️"
+    print(
+        f"{icon} {now_kst().strftime('%H:%M')} 00/30 동시스캔 완료 | "
+        f"+4~+21일 | 성공 {success}/{len(dates)} | "
+        f"{elapsed:.2f}초 | Discord 알림 {alerts} | "
+        f"매진변화 {soldout_changes} | 오류 {errors}"
+    )
+
+    return success, errors, alerts, soldout_changes
+
 def run_initial_monitor_scan(session, seen, booking_state):
-    """감시 시작 시 50일을 딱 한 번 훑어 캐시를 만든다."""
+    """감시 시작 시 현재 감시 범위를 딱 한 번 훑어 캐시를 만든다."""
     date_event_cache = {}
     dates = make_dates()
     alerts = 0
@@ -930,14 +1027,14 @@ def run_initial_monitor_scan(session, seen, booking_state):
             soldout += s
 
         if index % 10 == 0:
-            print(f"⏳ 첫 감시 준비: {index}/50 날짜 확인 완료")
+            print(f"⏳ 첫 감시 준비: {index}/{DAYS} 날짜 확인 완료")
 
     elapsed = time.monotonic() - scan_started
     counts = count_targets(merged_event_cache(date_event_cache))
 
     if not rate_limited:
         print(
-            "✅ 첫 50일 감시 확인 완료 | "
+            f"✅ 첫 {DAYS}일 감시 확인 완료 | "
             f"{elapsed:.2f}초 | "
             f"GV {counts['GV']} | 무대인사 {counts['무대인사']} | "
             f"IMAX {counts['IMAX']} | 4DX {counts['4DX']}"
@@ -956,6 +1053,7 @@ def run_monitor(session, seen, booking_state, program_started):
     window_errors = 0
     total_requests = 0
     last_request_started = 0.0
+    last_fast_scan_slot = None
 
     date_event_cache, init_alerts, init_soldout, init_errors, rate_limited = (
         run_initial_monitor_scan(session, seen, booking_state)
@@ -988,9 +1086,13 @@ def run_monitor(session, seen, booking_state, program_started):
 
     print(
         "📡 날짜별 분산 감시 시작 | "
-        "오늘~+4일 60초 / +5~+14일 20초 / "
-        "+15~+30일 45초 / +31~+49일 5분 | "
+        "오늘 5분 / 내일(+1) 20초 / +2~+4일 90초 / "
+        "+5~+14일 30초 / +15~+30일 60초 / +31~+42일 5분 | "
         "예매준비중·매진 날짜는 20초"
+    )
+    print(
+        "⚡ 고정 동시스캔 | 매시 00분 / 30분 | "
+        "+4~+21일 18일 | 18 workers 완전 동시"
     )
 
     while time.monotonic() - program_started < RUN_SECONDS:
@@ -999,6 +1101,26 @@ def run_monitor(session, seen, booking_state, program_started):
         remaining = RUN_SECONDS - elapsed_total
         if remaining <= 0:
             break
+
+        # 매시 00분/30분에는 +4~+21일 18일을 한 번에 동시 확인한다.
+        # 같은 분 안에서는 딱 한 번만 실행한다.
+        wall_now = now_kst()
+        if wall_now.minute in FAST_SCAN_MINUTES:
+            slot_key = wall_now.strftime("%Y%m%d%H%M")
+            if slot_key != last_fast_scan_slot:
+                last_fast_scan_slot = slot_key
+                fs_success, fs_errors, fs_alerts, fs_soldout = run_0030_fast_scan(
+                    seen,
+                    booking_state,
+                    date_event_cache,
+                )
+                total_requests += len(make_fast_scan_dates())
+                window_requests += len(make_fast_scan_dates())
+                window_success += fs_success
+                window_errors += fs_errors
+                window_alerts += fs_alerts
+                window_soldout += fs_soldout
+                continue
 
         # 10분 요약 시점이면 조회보다 먼저 요약을 출력한다.
         if now_mono - report_started >= SUMMARY_SECONDS:
@@ -1115,9 +1237,9 @@ def main():
     print("=" * 72)
     print("BRANCH:", SITE_NAME)
     print("TARGET: GV / 무대인사 / IMAX / 4DX")
-    print("DATE RANGE: TODAY ~ +49 DAYS (50 DAYS TOTAL)")
-    print("SCAN MODE: 50 DAYS / DATE-BY-DATE STAGGERED")
-    print("INTERVAL: +0~+4일 60s / +5~+14일 20s / +15~+30일 45s / +31~+49일 300s")
+    print(f"DATE RANGE: TODAY ~ +{DAYS - 1} DAYS ({DAYS} DAYS TOTAL)")
+    print(f"SCAN MODE: {DAYS} DAYS / DATE-BY-DATE STAGGERED")
+    print("INTERVAL: 오늘 300s / 내일(+1) 20s / +2~+4일 90s / +5~+14일 30s / +15~+30일 60s / +31~+42일 300s")
     print("PRIORITY: 예매준비중 또는 매진이 잡힌 날짜는 20s")
     print(f"MIN REQUEST START GAP: {MIN_REQUEST_GAP:.2f}s")
     print(f"HTTP 429: {RATE_LIMIT_COOLDOWN:.0f}s 전체 휴식 후 분산 재개")
@@ -1125,6 +1247,7 @@ def main():
     print("PREPARING: '예매준비중' 문구 또는 cntlYn=Y 감지")
     print("OPEN: 명시적 잔여좌석 > 0")
     print("REOPEN: 매진 -> 다시 좌석 발생 시 '좌석이 생겼습니다'")
+    print("FAST SCAN: 매시 00/30분 +4~+21일 18일 / 18 workers 완전 동시")
     print("LOG MODE: 기준값/첫확인 진행 + 정상 감시는 10분 요약")
     print("RUN SECONDS:", RUN_SECONDS)
     print("KST NOW:", now_kst().strftime("%Y-%m-%d %H:%M:%S"))
