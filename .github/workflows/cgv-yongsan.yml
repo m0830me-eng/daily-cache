@@ -1,4 +1,4 @@
-name: CGV Yongsan Auto Speed Test
+name: CGV Yongsan Monitor
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 345
 
     steps:
       - name: Checkout
@@ -46,35 +46,119 @@ jobs:
       - name: Set monitoring duration
         id: duration
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CRON_SCHEDULE: ${{ github.event.schedule }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # 수동 안정성 테스트: 30분
-            echo "seconds=1800" >> "$GITHUB_OUTPUT"
-          else
-            case "${{ github.event.schedule }}" in
-              "2 21 * * *")
-                echo "seconds=19800" >> "$GITHUB_OUTPUT"
-                ;;
-              "32 2 * * *")
-                echo "seconds=19800" >> "$GITHUB_OUTPUT"
-                ;;
-              "2 8 * * *")
-                echo "seconds=19800" >> "$GITHUB_OUTPUT"
-                ;;
-              "32 13 * * *")
-                echo "seconds=5220" >> "$GITHUB_OUTPUT"
-                ;;
-              *)
-                echo "seconds=1800" >> "$GITHUB_OUTPUT"
-                ;;
-            esac
-          fi
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          event_name = os.environ.get("EVENT_NAME", "")
+          schedule = os.environ.get("CRON_SCHEDULE", "")
+          now = datetime.now(ZoneInfo("Asia/Seoul"))
+
+          next_times = {
+              "2 21 * * *": (11, 32),   # 06:02 -> 11:32
+              "32 2 * * *": (17, 2),    # 11:32 -> 17:02
+              "2 8 * * *": (22, 32),    # 17:02 -> 22:32
+              "32 13 * * *": (0, 0),    # 22:32 -> 24:00
+          }
+
+          def seconds_until(hour, minute, next_day=False):
+              if next_day:
+                  target = (now + timedelta(days=1)).replace(
+                      hour=hour,
+                      minute=minute,
+                      second=0,
+                      microsecond=0,
+                  )
+              else:
+                  target = now.replace(
+                      hour=hour,
+                      minute=minute,
+                      second=0,
+                      microsecond=0,
+                  )
+                  if target <= now:
+                      target += timedelta(days=1)
+
+              # 다음 정규 실행과 겹치지 않도록 1분 전에 종료
+              return max(
+                  60,
+                  int((target - now).total_seconds()) - 60,
+              )
+
+          if event_name == "schedule":
+              if schedule not in next_times:
+                  print("seconds=600")
+                  raise SystemExit
+
+              hour, minute = next_times[schedule]
+
+              if hour == 0 and minute == 0:
+                  print(
+                      f"seconds={seconds_until(0, 0, next_day=True)}"
+                  )
+              else:
+                  print(
+                      f"seconds={seconds_until(hour, minute)}"
+                  )
+
+              raise SystemExit
+
+          # 수동 실행도 현재 시각에서 다음 정규 실행 1분 전까지 계속 감시.
+          h, m = now.hour, now.minute
+
+          if (h, m) < (6, 2):
+              target = now.replace(
+                  hour=6,
+                  minute=2,
+                  second=0,
+                  microsecond=0,
+              )
+          elif (h, m) < (11, 32):
+              target = now.replace(
+                  hour=11,
+                  minute=32,
+                  second=0,
+                  microsecond=0,
+              )
+          elif (h, m) < (17, 2):
+              target = now.replace(
+                  hour=17,
+                  minute=2,
+                  second=0,
+                  microsecond=0,
+              )
+          elif (h, m) < (22, 32):
+              target = now.replace(
+                  hour=22,
+                  minute=32,
+                  second=0,
+                  microsecond=0,
+              )
+          else:
+              target = (now + timedelta(days=1)).replace(
+                  hour=0,
+                  minute=0,
+                  second=0,
+                  microsecond=0,
+              )
+
+          seconds = max(
+              60,
+              int((target - now).total_seconds()) - 60,
+          )
+          print(f"seconds={seconds}")
+          PY
 
       - name: Run
         env:
+          RUN_SECONDS: ${{ steps.duration.outputs.seconds }}
           CY_WEBHOOK: ${{ secrets.CY_WEBHOOK }}
           DISCORD_MENTION_ID: ${{ secrets.DISCORD_MENTION_ID }}
-          RUN_SECONDS: ${{ steps.duration.outputs.seconds }}
         run: |
           python -u cinema_alert.py
 
@@ -85,7 +169,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add seen_cgv_yongsan.json baseline_cgv_yongsan.done 2>/dev/null || true
+          git add seen_cgv_yongsan.json baseline_cgv_yongsan.done cgv_yongsan_booking_state.json 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "No state changes"
