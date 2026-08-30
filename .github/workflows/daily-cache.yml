@@ -9,11 +9,8 @@ required: false
 default: "120"
 
 schedule:
-# KST 06:02
 - cron: "2 21 * * *"
-# KST 11:42
 - cron: "42 2 * * *"
-# KST 17:22
 - cron: "22 8 * * *"
 
 permissions:
@@ -41,8 +38,7 @@ steps:
       python-version: "3.12"
 
   - name: Install dependencies
-    run: |
-      pip install -r requirements.txt
+    run: pip install -r requirements.txt
 
   - name: Set monitoring duration
     id: duration
@@ -72,8 +68,7 @@ steps:
       CY_WEBHOOK: ${{ secrets.CY_WEBHOOK }}
       DISCORD_MENTION_ID: ${{ secrets.DISCORD_MENTION_ID }}
       RUN_SECONDS: ${{ steps.duration.outputs.seconds }}
-    run: |
-      python -u daily_cache.py
+    run: python -u daily_cache.py
 
   - name: Save state
     if: always()
@@ -81,7 +76,6 @@ steps:
     run: |
       git config user.name "github-actions[bot]"
       git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
       git add seen_cgv_yongsan.json baseline_cgv_yongsan.done 2>/dev/null || true
 
       if git diff --cached --quiet; then
