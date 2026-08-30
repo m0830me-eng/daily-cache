@@ -3,7 +3,6 @@ import sys
 import json
 import re
 import time
-import random
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
@@ -24,10 +23,8 @@ SITE_NO = "0013"
 SITE_NAME = "CGV 용산아이파크몰"
 
 DAYS = 50
-
-# 날짜별 요청 분산: 공개 CGV 알리미 방식 참고
-DATE_REQUEST_MIN_SECONDS = 0.3
-DATE_REQUEST_MAX_SECONDS = 0.5
+TARGET_CYCLE_SECONDS = 19.0
+SUMMARY_SECONDS = 600.0  # 정상 감시 요약: 10분마다 1회
 START_DELAY = float(os.environ.get("START_DELAY", "0"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "120"))
 
@@ -36,10 +33,24 @@ API_URL = "https://cgv.co.kr/api/v1/booking/searchMovScnInfo"
 
 STATE_FILE = "seen_cgv_yongsan.json"
 BASELINE_FILE = "baseline_cgv_yongsan.done"
+BOOKING_STATE_FILE = "cgv_yongsan_booking_state.json"
+BOOKING_STATE_SCHEMA = "CGV_YONGSAN_BOOKING_STATE_V1"
 
-GV_WEBHOOK = os.environ.get("DISCORD_CGV_YONGSAN_GV", "")
-STAGE_WEBHOOK = os.environ.get("DISCORD_CGV_YONGSAN_STAGE", "")
-DISCORD_USER_ID = "1383846907847381184"
+# 현재 workflow의 CY_WEBHOOK / DISCORD_MENTION_ID를 우선 사용.
+# 과거에 별도 GV/무대인사 웹훅을 쓰던 저장소도 그대로 호환한다.
+COMMON_WEBHOOK = os.environ.get("CY_WEBHOOK", "").strip()
+GV_WEBHOOK = (
+    os.environ.get("DISCORD_CGV_YONGSAN_GV", "").strip()
+    or COMMON_WEBHOOK
+)
+STAGE_WEBHOOK = (
+    os.environ.get("DISCORD_CGV_YONGSAN_STAGE", "").strip()
+    or COMMON_WEBHOOK
+)
+DISCORD_USER_ID = (
+    os.environ.get("DISCORD_MENTION_ID", "").strip()
+    or os.environ.get("DISCORD_USER_ID", "").strip()
+)
 
 # 사용자 제공 실제 용산 4DX 예매 링크에서 확인된 상영관 번호
 YONGSAN_4DX_SCNS_NO = "003"
@@ -49,6 +60,16 @@ HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
     "Referer": BOOKING_PAGE,
 }
+
+BLOCK_STATUSES = {403, 429, 500, 502, 503, 504}
+
+
+# ============================================================
+# Basic helpers
+# ============================================================
+
+def now_kst():
+    return datetime.now(KST)
 
 
 def clean_text(value):
@@ -60,11 +81,16 @@ def all_row_text(value):
 
     def walk(item):
         if isinstance(item, dict):
-            for v in item.values():
-                walk(v)
+            for key, val in item.items():
+                if val is not None:
+                    key_text = clean_text(key)
+                    val_text = clean_text(val) if not isinstance(val, (dict, list, tuple, set)) else ""
+                    if key_text and val_text:
+                        parts.append(f"{key_text}={val_text}")
+                walk(val)
         elif isinstance(item, (list, tuple, set)):
-            for v in item:
-                walk(v)
+            for val in item:
+                walk(val)
         elif item is not None:
             text = clean_text(item)
             if text:
@@ -74,30 +100,82 @@ def all_row_text(value):
     return " | ".join(parts)
 
 
+def make_dates():
+    today = now_kst()
+    return [
+        (today + timedelta(days=i)).strftime("%Y%m%d")
+        for i in range(DAYS)
+    ]
+
+
+def pretty_date(date):
+    dt = datetime.strptime(date, "%Y%m%d")
+    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
+    return f"{dt.year}-{dt.month:02d}-{dt.day:02d} ({weekdays[dt.weekday()]})"
+
+
+def pretty_time(value):
+    text = clean_text(value).replace(":", "")
+    if len(text) == 4 and text.isdigit():
+        return text[:2] + ":" + text[2:]
+    return clean_text(value)
+
+
+def parse_int(value):
+    if value is None:
+        return None
+    # "4", "4석", "4/624" 모두 앞의 실제 잔여값 4로 읽는다.
+    match = re.search(r"-?\d+", str(value))
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except Exception:
+        return None
+
+
+# ============================================================
+# Discord
+# ============================================================
+
+def webhook_for_type(event_type):
+    if event_type == "무대인사":
+        return STAGE_WEBHOOK or COMMON_WEBHOOK
+    return GV_WEBHOOK or COMMON_WEBHOOK
+
+
 def send_discord(webhook, message):
     if not webhook:
-        print("WEBHOOK MISSING")
+        print("⚠️ DISCORD WEBHOOK MISSING")
         return False
+
+    payload = {
+        "content": message,
+        "flags": 4,
+    }
+
+    if DISCORD_USER_ID:
+        payload["allowed_mentions"] = {
+            "users": [DISCORD_USER_ID]
+        }
 
     try:
         r = requests.post(
             webhook,
-            json={
-                "content": message,
-                "flags": 4,
-                "allowed_mentions": {
-                    "users": [DISCORD_USER_ID]
-                },
-            },
+            json=payload,
             impersonate="chrome",
             timeout=15,
         )
         r.raise_for_status()
         return True
     except Exception as e:
-        print("DISCORD ERROR:", repr(e))
+        print("❌ DISCORD ERROR:", repr(e))
         return False
 
+
+# ============================================================
+# Persistent state
+# ============================================================
 
 def load_seen():
     if not os.path.exists(STATE_FILE):
@@ -108,58 +186,74 @@ def load_seen():
             data = json.load(f)
         return set(data) if isinstance(data, list) else set()
     except Exception as e:
-        print("STATE LOAD ERROR:", repr(e))
+        print("⚠️ STATE LOAD ERROR:", repr(e))
         return set()
 
 
-def save_seen(seen):
+def save_seen(seen, quiet=True):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
-        print("STATE SAVED:", len(seen))
+        if not quiet:
+            print("STATE SAVED:", len(seen))
     except Exception as e:
-        print("STATE SAVE ERROR:", repr(e))
-
-
-def mark_baseline_done():
-    with open(BASELINE_FILE, "w", encoding="utf-8") as f:
-        f.write(datetime.now(KST).isoformat())
-    print("BASELINE MARKER CREATED")
+        print("⚠️ STATE SAVE ERROR:", repr(e))
 
 
 def baseline_done():
     return os.path.exists(BASELINE_FILE)
 
 
-def event_key(date, row, event_type):
-    return "|".join([
-        SITE_NO,
-        date,
-        str(row.get("movNo") or ""),
-        str(row.get("scnsNo") or ""),
-        str(row.get("scnSseq") or ""),
-        str(row.get("scnsrtTm") or ""),
-        event_type,
-    ])
+def mark_baseline_done():
+    with open(BASELINE_FILE, "w", encoding="utf-8") as f:
+        f.write(now_kst().isoformat())
+    print("BASELINE MARKER CREATED")
 
 
-def make_booking_link(date, row):
-    params = {
-        "movNo": str(row.get("movNo") or ""),
-        "scnYmd": date,
-        "siteNo": SITE_NO,
-        "scnsNo": str(row.get("scnsNo") or ""),
-        "siteNm": SITE_NAME,
-        "scnSseq": str(row.get("scnSseq") or ""),
+def load_booking_state():
+    if not os.path.exists(BOOKING_STATE_FILE):
+        return {}, False
+
+    try:
+        with open(BOOKING_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return {}, False
+
+        if data.get("schema") != BOOKING_STATE_SCHEMA:
+            return {}, False
+
+        shows = data.get("shows")
+        if not isinstance(shows, dict):
+            return {}, False
+
+        return shows, True
+
+    except Exception as e:
+        print("⚠️ BOOKING STATE LOAD ERROR:", repr(e))
+        return {}, False
+
+
+def save_booking_state(shows):
+    payload = {
+        "schema": BOOKING_STATE_SCHEMA,
+        "updated_at_kst": now_kst().isoformat(),
+        "shows": shows,
     }
-    return "https://cgv.co.kr/cnm/movieBook/movie?" + urlencode(params)
+
+    try:
+        temp = BOOKING_STATE_FILE + ".tmp"
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(temp, BOOKING_STATE_FILE)
+    except Exception as e:
+        print("⚠️ BOOKING STATE SAVE ERROR:", repr(e))
 
 
-def pretty_date(date):
-    dt = datetime.strptime(date, "%Y%m%d")
-    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
-    return f"{dt.year}-{dt.month:02d}-{dt.day:02d} ({weekdays[dt.weekday()]})"
-
+# ============================================================
+# CGV target classification
+# ============================================================
 
 def detect_event_type(row):
     event_fields = [
@@ -232,7 +326,7 @@ def detect_format(row):
     format_upper = format_text.upper()
     full_upper = full_text.upper()
 
-    # 용산 4DX는 실제 예매 링크에서 scnsNo=003 확인됨.
+    # GV/무대인사 우선 분류 후, 일반 특별관만 여기까지 온다.
     if (
         "4DX" in format_upper
         or "4DX" in full_upper
@@ -252,13 +346,148 @@ def detect_format(row):
 
 
 def get_target_type(row):
-    # GV/무대인사 회차가 특별관이어도 이벤트 알림을 우선해 중복 알림 방지.
+    # 이벤트 회차가 특별관이어도 GV/무대인사를 우선해 중복 알림 방지.
     event_type = detect_event_type(row)
     if event_type:
         return event_type
-
     return detect_format(row)
 
+
+# ============================================================
+# Booking-state classification
+# ============================================================
+
+def classify_booking_state(row):
+    """
+    사용자에게 보여주는 상태:
+      PREPARING -> 예매 준비중
+      OPEN      -> 예매 오픈 가능
+      SOLD_OUT  -> 매진 저장(알림 없음)
+      UNKNOWN   -> 확실한 상태값 없음
+
+    우선순위:
+      1) 실제 API 문구의 예매준비중
+      2) 실제 매진 문구
+      3) cntlYn=Y (CGV 제어/비예매 상태) -> 준비중으로 추적
+      4) 명시적 잔여석 > 0 -> OPEN
+      5) cntlYn=N/예매가능 플래그 + 잔여석 0 -> SOLD_OUT
+    """
+    full_text = all_row_text(row)
+    compact = re.sub(r"\s+", "", full_text)
+    upper = full_text.upper()
+
+    if "예매준비중" in compact:
+        return "PREPARING", "text:예매준비중"
+
+    if (
+        "매진" in compact
+        or "SOLD OUT" in upper
+        or "SOLDOUT" in upper
+    ):
+        return "SOLD_OUT", "text:매진"
+
+    cntl = clean_text(row.get("cntlYn")).upper()
+    if cntl == "Y":
+        return "PREPARING", "cntlYn=Y"
+
+    seat_fields = [
+        "frSeatCnt",
+        "restSeatCnt",
+        "remainSeatCnt",
+        "remainSeats",
+        "seatCnt",
+    ]
+
+    seat_count = None
+    seat_source = ""
+    for field in seat_fields:
+        if field in row and row.get(field) is not None:
+            parsed = parse_int(row.get(field))
+            if parsed is not None:
+                seat_count = parsed
+                seat_source = field
+                break
+
+    if seat_count is not None and seat_count > 0:
+        return "OPEN", f"{seat_source}={seat_count}"
+
+    book_flag = clean_text(
+        row.get("bookYn")
+        or row.get("bookingYn")
+        or row.get("rsvYn")
+    ).upper()
+
+    if seat_count == 0 and (cntl == "N" or book_flag == "Y"):
+        return "SOLD_OUT", f"{seat_source}=0"
+
+    return "UNKNOWN", "no-explicit-status"
+
+
+# ============================================================
+# Event normalization
+# ============================================================
+
+def event_key(date, row, event_type):
+    return "|".join([
+        SITE_NO,
+        date,
+        str(row.get("movNo") or ""),
+        str(row.get("scnsNo") or ""),
+        str(row.get("scnSseq") or ""),
+        str(row.get("scnsrtTm") or ""),
+        event_type,
+    ])
+
+
+def make_booking_link(date, row):
+    params = {
+        "movNo": str(row.get("movNo") or ""),
+        "scnYmd": date,
+        "siteNo": SITE_NO,
+        "scnsNo": str(row.get("scnsNo") or ""),
+        "siteNm": SITE_NAME,
+        "scnSseq": str(row.get("scnSseq") or ""),
+    }
+    return "https://cgv.co.kr/cnm/movieBook/movie?" + urlencode(params)
+
+
+def normalize_event(date, row, target_type):
+    status, status_source = classify_booking_state(row)
+
+    return {
+        "date": date,
+        "type": target_type,
+        "movie": clean_text(row.get("movNm") or row.get("movName")),
+        "screen": clean_text(
+            row.get("scnsNm")
+            or row.get("scnsName")
+            or row.get("screenNm")
+            or row.get("screenName")
+        ),
+        "time": clean_text(row.get("scnsrtTm")),
+        "status": status,
+        "status_source": status_source,
+        "link": make_booking_link(date, row),
+        "row": row,
+    }
+
+
+def state_record(event, status=None):
+    return {
+        "status": status or event.get("status", "UNKNOWN"),
+        "date": event.get("date", ""),
+        "type": event.get("type", ""),
+        "movie": event.get("movie", ""),
+        "screen": event.get("screen", ""),
+        "time": event.get("time", ""),
+        "status_source": event.get("status_source", ""),
+        "updated_at_kst": now_kst().isoformat(),
+    }
+
+
+# ============================================================
+# API
+# ============================================================
 
 def extract_rows(data):
     if isinstance(data, dict):
@@ -304,19 +533,21 @@ def check_one_date(session, date):
         )
         elapsed = time.monotonic() - started
 
-        print(
-            f"API {date} STATUS={r.status_code} "
-            f"TIME={elapsed:.2f}s SIZE={len(r.content):,} bytes"
-        )
-
-        if r.status_code in (403, 429, 503):
-            print(f"!!! CGV RATE LIMIT / BLOCK ON {date} !!!")
-            return None
+        if r.status_code in BLOCK_STATUSES:
+            return None, (
+                f"HTTP {r.status_code} | DATE={date} | {elapsed:.2f}s"
+            )
 
         if r.status_code != 200:
-            return events
+            return None, (
+                f"HTTP {r.status_code} | DATE={date} | {elapsed:.2f}s"
+            )
 
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception as e:
+            return None, f"JSON ERROR | DATE={date} | {repr(e)}"
+
         rows = extract_rows(data)
 
         for row in rows:
@@ -325,264 +556,390 @@ def check_one_date(session, date):
                 continue
 
             key = event_key(date, row, target_type)
-            events[key] = {
-                "date": date,
-                "type": target_type,
-                "movie": clean_text(row.get("movNm") or row.get("movName")),
-                "screen": clean_text(
-                    row.get("scnsNm")
-                    or row.get("scnsName")
-                    or row.get("screenNm")
-                    or row.get("screenName")
-                ),
-                "time": clean_text(row.get("scnsrtTm")),
-                "row": row,
-            }
+            events[key] = normalize_event(date, row, target_type)
+
+        return events, None
 
     except Exception as e:
-        print("DATE ERROR:", date, repr(e))
-
-    return events
+        return None, f"REQUEST ERROR | DATE={date} | {repr(e)}"
 
 
-def make_dates():
-    today = datetime.now(KST)
-    return [
-        (today + timedelta(days=i)).strftime("%Y%m%d")
-        for i in range(DAYS)
-    ]
+# ============================================================
+# Notifications / transitions
+# ============================================================
+
+def notification_title(event_type, alert_kind):
+    if alert_kind == "PREPARING":
+        return f"⏳ {SITE_NAME} {event_type} · 예매 준비중"
+    if alert_kind == "OPEN":
+        return f"🚨 {SITE_NAME} {event_type} · 예매 오픈"
+    if alert_kind == "REOPEN":
+        return f"🎟️ {SITE_NAME} {event_type} · 좌석이 생겼습니다"
+    return f"🎉 {SITE_NAME} {event_type} · 새 상영 일정"
 
 
-def print_target_counts(events):
+def send_event_alert(event, alert_kind):
+    lines = []
+
+    if DISCORD_USER_ID:
+        lines.append(f"<@{DISCORD_USER_ID}>")
+        lines.append("")
+
+    lines.extend([
+        f"**{notification_title(event['type'], alert_kind)}**",
+        "",
+        f"📅 **{pretty_date(event['date'])}**",
+    ])
+
+    start = pretty_time(event.get("time", ""))
+    movie = event.get("movie", "") or "영화명 미확인"
+    screen = event.get("screen", "")
+    linked_movie = f"[{movie}]({event['link']})"
+
+    if screen:
+        lines.append(f"🎟️ {start} · {linked_movie} · {screen}")
+    else:
+        lines.append(f"🎟️ {start} · {linked_movie}")
+
+    ok = send_discord(
+        webhook_for_type(event["type"]),
+        "\n".join(lines),
+    )
+
+    if ok:
+        label = {
+            "PREPARING": "예매 준비중",
+            "OPEN": "예매 오픈",
+            "REOPEN": "좌석 재발생",
+            "NEW": "새 상영 일정",
+        }.get(alert_kind, alert_kind)
+        print(
+            f"🔔 {label} | {event['date']} | {event['type']} | "
+            f"{start} | {movie} | {screen}"
+        )
+
+    return ok
+
+
+def process_event(key, event, seen, booking_state):
+    """
+    Returns: (discord_alerts, soldout_changes)
+    """
+    current = event.get("status", "UNKNOWN")
+    previous_record = booking_state.get(key)
+    previous = (
+        previous_record.get("status", "UNKNOWN")
+        if isinstance(previous_record, dict)
+        else "UNKNOWN"
+    )
+
+    is_new_key = key not in seen
+    alerts = 0
+    soldout_changes = 0
+
+    # 현재 상태를 확실히 알 수 없으면 기존 확정 상태를 지우지 않는다.
+    if current == "UNKNOWN":
+        if is_new_key:
+            if send_event_alert(event, "NEW"):
+                seen.add(key)
+                booking_state[key] = state_record(event, "UNKNOWN")
+                alerts += 1
+        return alerts, soldout_changes
+
+    # 최초 발견이 이미 매진이면 알림 없이 기억만 한다.
+    if current == "SOLD_OUT" and is_new_key:
+        seen.add(key)
+        booking_state[key] = state_record(event, "SOLD_OUT")
+        print(
+            f"🔒 매진 상태 저장 | {event['date']} | {event['type']} | "
+            f"{pretty_time(event['time'])} | {event['movie']}"
+        )
+        return alerts, 1
+
+    # 새 회차가 준비중/오픈 상태로 처음 API에 등장.
+    if is_new_key:
+        alert_kind = "PREPARING" if current == "PREPARING" else "OPEN"
+        if send_event_alert(event, alert_kind):
+            seen.add(key)
+            booking_state[key] = state_record(event, current)
+            alerts += 1
+        return alerts, soldout_changes
+
+    # 이미 알려진 회차인데 새 booking-state 파일에 기록이 없는 경우:
+    # 기존 상태를 UNKNOWN으로 보고 확정 상태가 생겼을 때만 알린다.
+    if previous_record is None:
+        previous = "UNKNOWN"
+
+    # 같은 상태면 조용히 최신 메타데이터만 갱신.
+    if current == previous:
+        booking_state[key] = state_record(event, current)
+        return alerts, soldout_changes
+
+    # 불명확 -> 준비중/오픈: 상태가 처음 확실해진 순간 알림.
+    if previous == "UNKNOWN" and current in {"PREPARING", "OPEN"}:
+        alert_kind = "PREPARING" if current == "PREPARING" else "OPEN"
+        if send_event_alert(event, alert_kind):
+            booking_state[key] = state_record(event, current)
+            alerts += 1
+        return alerts, soldout_changes
+
+    # 준비중 -> 오픈
+    if previous == "PREPARING" and current == "OPEN":
+        if send_event_alert(event, "OPEN"):
+            booking_state[key] = state_record(event, "OPEN")
+            alerts += 1
+        return alerts, soldout_changes
+
+    # 오픈/준비중/불명확 -> 매진: Discord는 보내지 않고 상태만 기억.
+    if current == "SOLD_OUT" and previous != "SOLD_OUT":
+        booking_state[key] = state_record(event, "SOLD_OUT")
+        soldout_changes += 1
+        print(
+            f"🔒 매진 상태 저장 | {event['date']} | {event['type']} | "
+            f"{pretty_time(event['time'])} | {event['movie']}"
+        )
+        return alerts, soldout_changes
+
+    # 핵심: 매진 -> 다시 예매 가능 = 취소표/좌석 재발생.
+    if previous == "SOLD_OUT" and current == "OPEN":
+        if send_event_alert(event, "REOPEN"):
+            booking_state[key] = state_record(event, "OPEN")
+            alerts += 1
+        return alerts, soldout_changes
+
+    # SOLD_OUT -> PREPARING은 매진 기억을 유지한다.
+    # OPEN -> PREPARING도 일시적인 제어 플래그로 보고 OPEN 기억을 유지해
+    # 다시 OPEN이 됐을 때 중복 예매오픈 알림이 생기지 않게 한다.
+    if current == "PREPARING" and previous in {"SOLD_OUT", "OPEN"}:
+        return alerts, soldout_changes
+
+    booking_state[key] = state_record(event, current)
+    return alerts, soldout_changes
+
+
+# ============================================================
+# Scan / compact logging
+# ============================================================
+
+def count_targets(events):
     counts = {
         "GV": 0,
         "무대인사": 0,
         "IMAX": 0,
         "4DX": 0,
     }
-
     for event in events.values():
         event_type = event.get("type")
         if event_type in counts:
             counts[event_type] += 1
-
-    print("GV COUNT:", counts["GV"])
-    print("STAGE COUNT:", counts["무대인사"])
-    print("IMAX COUNT:", counts["IMAX"])
-    print("4DX COUNT:", counts["4DX"])
+    return counts
 
 
-def send_new_events(events, seen):
-    new_events = []
-
-    for key in sorted(events):
-        if key in seen:
-            continue
-
-        event = events[key]
-        start = event["time"]
-
-        if len(start) == 4 and start.isdigit():
-            start = start[:2] + ":" + start[2:]
-
-        new_events.append({
-            "key": key,
-            "event": event,
-            "start": start,
-            "link": make_booking_link(event["date"], event["row"]),
-        })
-
-    if not new_events:
-        return 0
-
-    groups = {}
-
-    for item in new_events:
-        event = item["event"]
-
-        if event["type"] == "IMAX":
-            group_type = "IMAX"
-            title = "새로운 용산 IMAX 상영 일정"
-            webhook = GV_WEBHOOK
-        elif event["type"] == "4DX":
-            group_type = "4DX"
-            title = "새로운 용산 4DX 상영 일정"
-            webhook = GV_WEBHOOK
-        elif event["type"] == "GV":
-            group_type = "GV"
-            title = "새로운 용산 GV 상영 일정"
-            webhook = GV_WEBHOOK
-        else:
-            group_type = "무대인사"
-            title = "새로운 용산 무대인사 상영 일정"
-            webhook = STAGE_WEBHOOK
-
-        group_key = (event["date"], group_type)
-        groups.setdefault(
-            group_key,
-            {
-                "title": title,
-                "webhook": webhook,
-                "items": [],
-            },
-        )["items"].append(item)
-
-    sent_count = 0
-
-    for (date, group_type), group in sorted(groups.items()):
-        group["items"].sort(
-            key=lambda item: (
-                item["start"],
-                item["event"]["movie"],
-            )
-        )
-
-        lines = [
-            f"<@{DISCORD_USER_ID}>",
-            "",
-            f"🎉 **{group['title']}** 🎉",
-            "",
-            f"📅 **{pretty_date(date)}**",
-        ]
-
-        for item in group["items"]:
-            event = item["event"]
-            screen_suffix = f" | {event['screen']}" if event["screen"] else ""
-            lines.append(
-                f"• 🎟️ [{item['start']} — {event['movie']}{screen_suffix}]"
-                f"({item['link']})"
-            )
-
-        print(
-            "NEW EVENT GROUP:",
-            group_type,
-            date,
-            "COUNT=",
-            len(group["items"]),
-        )
-
-        if send_discord(group["webhook"], "\n".join(lines)):
-            for item in group["items"]:
-                seen.add(item["key"])
-                sent_count += 1
-
-    return sent_count
-
-
-def distributed_wait():
-    wait_seconds = random.uniform(
-        DATE_REQUEST_MIN_SECONDS,
-        DATE_REQUEST_MAX_SECONDS,
-    )
-    print(f"NEXT DATE WAIT: {wait_seconds:.2f}s")
-    time.sleep(wait_seconds)
-
-
-def collect_baseline(session):
+def collect_full_scan(session, progress=False):
     all_events = {}
-    blocked_dates = []
-    dates = make_dates()
 
-    for index, date in enumerate(dates):
-        events = check_one_date(session, date)
-        if events is None:
-            blocked_dates.append(date)
-        else:
-            all_events.update(events)
+    for index, date in enumerate(make_dates(), start=1):
+        events, error = check_one_date(session, date)
+        if error:
+            print(f"❌ CGV API 오류 | {error}")
+            return None, error
 
-        if index < len(dates) - 1:
-            distributed_wait()
+        all_events.update(events)
 
-    if blocked_dates:
-        print(
-            "BASELINE BLOCKED DATES:",
-            len(blocked_dates),
-            "/",
-            DAYS,
-            "- 기준값 생성은 다음 실행에서 다시 시도합니다.",
-        )
-        return None
+        if progress and index % 10 == 0:
+            print(f"⏳ 기준값 진행: {index}/50 날짜 처리 완료")
 
-    return all_events
+    return all_events, None
 
 
-def scan_cycle(session, seen, cycle_number):
-    cycle_started = time.monotonic()
-    all_events = {}
-    success_count = 0
-    new_total = 0
-    blocked_dates = []
-    dates = make_dates()
+def initialize_missing_state(session, seen, booking_state, booking_state_ready):
+    need_seen_baseline = not baseline_done()
+    need_booking_baseline = not booking_state_ready
+
+    if not need_seen_baseline and not need_booking_baseline:
+        return seen, booking_state, True
 
     print()
-    print("=" * 70)
+    print("=" * 72)
+    print("INITIAL 50-DAY BASELINE")
+    print("=" * 72)
+
+    if need_seen_baseline and need_booking_baseline:
+        print(
+            "현재 50일 전체 GV / 무대인사 / IMAX / 4DX와 예매 상태를 "
+            "알림 없이 기준값으로 등록합니다."
+        )
+    elif need_booking_baseline:
+        print(
+            "기존 회차 기준값은 유지하고, 현재 50일 전체 예매 상태만 "
+            "알림 없이 새 기준값으로 등록합니다."
+        )
+    else:
+        print(
+            "현재 50일 전체 GV / 무대인사 / IMAX / 4DX를 "
+            "알림 없이 기준값으로 등록합니다."
+        )
+
+    events, error = collect_full_scan(session, progress=True)
+    if error or events is None:
+        print("BASELINE FAILED - 불완전한 기준값은 저장하지 않습니다.")
+        return seen, booking_state, False
+
+    if need_seen_baseline:
+        seen = set(events.keys())
+        save_seen(seen)
+        mark_baseline_done()
+
+    if need_booking_baseline:
+        booking_state = {
+            key: state_record(event, event.get("status", "UNKNOWN"))
+            for key, event in events.items()
+        }
+        save_booking_state(booking_state)
+
+    counts = count_targets(events)
+    print("BASELINE EVENT COUNT:", len(events))
     print(
-        f"CYCLE #{cycle_number} START | "
-        f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} KST | "
-        f"50 DAYS | DISTRIBUTED SEQUENTIAL | "
-        f"DATE GAP={DATE_REQUEST_MIN_SECONDS:.1f}~"
-        f"{DATE_REQUEST_MAX_SECONDS:.1f}s"
+        "BASELINE COUNTS: "
+        f"GV={counts['GV']} | 무대인사={counts['무대인사']} | "
+        f"IMAX={counts['IMAX']} | 4DX={counts['4DX']}"
     )
-    print("=" * 70)
+    print("BASELINE COMPLETE")
+    print("이번 기준값 등록에서는 Discord 알림을 보내지 않았습니다.")
+    print(
+        "✅ 기준값 등록 완료 - 이 실행을 종료하지 않고 "
+        "다음 정규 자동실행 1분 전까지 계속 감시합니다."
+    )
 
-    for index, date in enumerate(dates):
-        events = check_one_date(session, date)
+    return seen, booking_state, True
 
-        if events is None:
-            blocked_dates.append(date)
-            print(
-                f"SKIP BLOCKED DATE: {date} - "
-                "다음 날짜 감시를 계속합니다."
-            )
-        else:
-            success_count += 1
+
+def run_monitor(session, seen, booking_state, program_started):
+    cycle_number = 0
+    report_started = time.monotonic()
+    window_cycles = 0
+    window_alerts = 0
+    window_soldout = 0
+    window_errors = 0
+    latest_counts = {"GV": 0, "무대인사": 0, "IMAX": 0, "4DX": 0}
+    first_cycle_reported = False
+
+    while time.monotonic() - program_started < RUN_SECONDS:
+        cycle_number += 1
+        cycle_started = time.monotonic()
+        all_events = {}
+        cycle_alerts = 0
+        cycle_soldout = 0
+        cycle_error = None
+
+        for date in make_dates():
+            events, error = check_one_date(session, date)
+
+            if error:
+                cycle_error = error
+                window_errors += 1
+                print(f"❌ CGV API 오류 | {error}")
+                break
+
             all_events.update(events)
 
-            # 날짜 응답이 도착한 즉시 새 회차를 Discord로 보냄.
-            new_total += send_new_events(events, seen)
+            # 날짜 응답이 도착하는 즉시 상태 변화/신규 회차 처리.
+            for key, event in events.items():
+                alerts, soldout_changes = process_event(
+                    key,
+                    event,
+                    seen,
+                    booking_state,
+                )
+                cycle_alerts += alerts
+                cycle_soldout += soldout_changes
 
-        # 50개 요청을 한꺼번에 몰아치지 않도록 날짜 사이를 분산.
-        if index < len(dates) - 1:
-            distributed_wait()
+        save_seen(seen)
+        save_booking_state(booking_state)
+
+        cycle_elapsed = time.monotonic() - cycle_started
+
+        if cycle_error is None:
+            window_cycles += 1
+            window_alerts += cycle_alerts
+            window_soldout += cycle_soldout
+            latest_counts = count_targets(all_events)
+
+            if not first_cycle_reported:
+                print(
+                    "✅ 첫 50일 감시 사이클 완료 | "
+                    f"CYCLE #1 | {cycle_elapsed:.2f}초 | "
+                    f"GV {latest_counts['GV']} | "
+                    f"무대인사 {latest_counts['무대인사']} | "
+                    f"IMAX {latest_counts['IMAX']} | "
+                    f"4DX {latest_counts['4DX']}"
+                )
+                first_cycle_reported = True
+
+        now_mono = time.monotonic()
+        if now_mono - report_started >= SUMMARY_SECONDS:
+            print(
+                "💚 정상 감시중 | "
+                f"최근 10분 {window_cycles}사이클 완료 | "
+                f"누적 CYCLE #{cycle_number} | "
+                f"GV {latest_counts['GV']} | "
+                f"무대인사 {latest_counts['무대인사']} | "
+                f"IMAX {latest_counts['IMAX']} | "
+                f"4DX {latest_counts['4DX']} | "
+                f"Discord 알림 {window_alerts} | "
+                f"매진변화 {window_soldout} | "
+                f"오류 {window_errors}"
+            )
+            report_started = now_mono
+            window_cycles = 0
+            window_alerts = 0
+            window_soldout = 0
+            window_errors = 0
+
+        elapsed_total = time.monotonic() - program_started
+        remaining = RUN_SECONDS - elapsed_total
+        if remaining <= 0:
+            break
+
+        wait_time = max(0.0, TARGET_CYCLE_SECONDS - cycle_elapsed)
+        wait_time = min(wait_time, remaining)
+
+        if wait_time > 0:
+            time.sleep(wait_time)
 
     save_seen(seen)
+    save_booking_state(booking_state)
 
-    cycle_elapsed = time.monotonic() - cycle_started
-
-    print_target_counts(all_events)
     print(
-        f"CYCLE #{cycle_number} DONE | "
-        f"SUCCESS={success_count}/{DAYS} | "
-        f"BLOCKED={len(blocked_dates)} | "
-        f"NEW={new_total} | "
-        f"ELAPSED={cycle_elapsed:.2f}s"
+        "✅ CGV 감시 종료 | "
+        f"누적 CYCLE #{cycle_number} | "
+        f"다음 정규 실행에 상태를 이어갑니다."
     )
 
-    if blocked_dates:
-        print(
-            "BLOCKED DATES:",
-            ", ".join(blocked_dates),
-        )
-        print(
-            "긴 쿨다운 없이 다음 사이클에서 다시 확인합니다."
-        )
 
-    return len(blocked_dates), cycle_elapsed
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    print("=" * 70)
-    print("CGV YONGSAN 50-DAY DISTRIBUTED MONITOR")
-    print("TARGET: GV / STAGE / IMAX / 4DX")
+    program_started = time.monotonic()
+
+    print("=" * 72)
+    print("CGV YONGSAN MONITOR")
+    print("=" * 72)
+    print("BRANCH:", SITE_NAME)
+    print("TARGET: GV / 무대인사 / IMAX / 4DX")
     print("DATE RANGE: TODAY ~ +49 DAYS (50 DAYS TOTAL)")
-    print("SCAN MODE: 1 DATE AT A TIME / DISTRIBUTED SEQUENTIAL")
-    print(
-        f"DATE REQUEST GAP: {DATE_REQUEST_MIN_SECONDS:.1f}~"
-        f"{DATE_REQUEST_MAX_SECONDS:.1f} SECONDS"
-    )
-    print("429/403/503: BLOCKED DATE만 건너뛰고 다음 날짜 계속 감시")
-    print("4DX FALLBACK: YONGSAN scnsNo=003")
+    print("SCAN MODE: 50 DAYS / SEQUENTIAL / 1 REQUEST AT A TIME")
+    print(f"FIXED CYCLE TARGET: {TARGET_CYCLE_SECONDS:.0f}s")
+    print("EARLY DETECTION: 화면 표시 전이라도 CGV API에 대상 회차/종류가 있으면 추적")
+    print("PREPARING: '예매준비중' 문구 또는 cntlYn=Y 감지")
+    print("OPEN: 명시적 잔여좌석 > 0")
+    print("REOPEN: 매진 -> 다시 좌석 발생 시 '좌석이 생겼습니다'")
+    print("LOG MODE: 기준값 10/20/30/40/50 진행 + 정상 감시는 10분 요약")
     print("RUN SECONDS:", RUN_SECONDS)
-    print("=" * 70)
+    print("KST NOW:", now_kst().strftime("%Y-%m-%d %H:%M:%S"))
+    print("=" * 72)
 
     if START_DELAY > 0:
         print(f"START STAGGER: {START_DELAY:.2f}s")
@@ -591,60 +948,42 @@ def main():
     session = requests.Session(impersonate="chrome")
 
     try:
-        r = session.get(BOOKING_PAGE, timeout=20)
+        r = session.get(
+            BOOKING_PAGE,
+            headers=HEADERS,
+            timeout=20,
+        )
         print("BOOKING PAGE STATUS:", r.status_code)
         if r.status_code != 200:
-            print("CGV BOOKING PAGE ERROR")
-            return
+            print("⚠️ CGV BOOKING PAGE CHECK FAILED - API 감시는 계속합니다.")
     except Exception as e:
-        print("BOOKING PAGE ERROR:", repr(e))
-        return
-
-    if not baseline_done():
-        print()
-        print("=" * 70)
-        print("INITIAL 50-DAY BASELINE")
-        print("=" * 70)
-        print(
-            "현재 GV / 무대인사 / IMAX / 4DX를 "
-            "알림 없이 기준값으로 등록합니다."
-        )
-
-        events = collect_baseline(session)
-        if events is None:
-            print("BASELINE FAILED: CGV RATE LIMIT / BLOCK")
-            return
-
-        print_target_counts(events)
-        seen = set(events.keys())
-        print("BASELINE EVENT COUNT:", len(seen))
-        save_seen(seen)
-        mark_baseline_done()
-        print("BASELINE COMPLETE - 이번 실행에서는 Discord 알림을 보내지 않았습니다.")
-        return
+        print("⚠️ CGV BOOKING PAGE CHECK WARNING:", repr(e))
+        print("BOOKING PAGE CHECK FAILED - API 감시는 계속합니다.")
 
     seen = load_seen()
-    monitor_started = time.monotonic()
-    cycle_number = 0
+    booking_state, booking_state_ready = load_booking_state()
 
-    while time.monotonic() - monitor_started < RUN_SECONDS:
-        cycle_number += 1
+    seen, booking_state, ready = initialize_missing_state(
+        session,
+        seen,
+        booking_state,
+        booking_state_ready,
+    )
 
-        blocked_count, cycle_elapsed = scan_cycle(
-            session,
-            seen,
-            cycle_number,
-        )
+    if not ready:
+        return
 
-        print(
-            f"NEXT CYCLE IMMEDIATELY | "
-            f"PREVIOUS={cycle_elapsed:.2f}s | "
-            f"BLOCKED={blocked_count}"
-        )
+    # 기준값 등록에 걸린 시간도 RUN_SECONDS에 포함한다.
+    if time.monotonic() - program_started >= RUN_SECONDS:
+        print("RUN TIME FINISHED AFTER BASELINE")
+        return
 
-    save_seen(seen)
-    print("FINAL SEEN STATE:", len(seen))
-    print("DONE")
+    run_monitor(
+        session,
+        seen,
+        booking_state,
+        program_started,
+    )
 
 
 if __name__ == "__main__":
