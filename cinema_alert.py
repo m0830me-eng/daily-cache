@@ -23,7 +23,20 @@ SITE_NO = "0013"
 SITE_NAME = "CGV 용산아이파크몰"
 
 DAYS = 50
-TARGET_CYCLE_SECONDS = 19.0
+
+# 50일은 그대로 유지하되 날짜 구간별로 조회 주기를 다르게 한다.
+# +0~+4일   : 60초
+# +5~+14일  : 20초 (가장 빠른 핵심 구간)
+# +15~+30일 : 45초
+# +31~+49일 : 300초
+# 단, 예매 준비중 또는 매진 상태가 잡힌 날짜는 20초로 승격한다.
+INTERVAL_NEAR = 60.0
+INTERVAL_HOT = 20.0
+INTERVAL_MID = 45.0
+INTERVAL_FAR = 300.0
+PRIORITY_INTERVAL = 20.0
+MIN_REQUEST_GAP = 0.35
+RATE_LIMIT_COOLDOWN = 60.0
 SUMMARY_SECONDS = 600.0  # 정상 감시 요약: 10분마다 1회
 START_DELAY = float(os.environ.get("START_DELAY", "0"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "120"))
@@ -814,106 +827,279 @@ def initialize_missing_state(session, seen, booking_state, booking_state_ready):
     return seen, booking_state, True
 
 
+def base_interval_for_offset(offset):
+    if offset <= 4:
+        return INTERVAL_NEAR
+    if offset <= 14:
+        return INTERVAL_HOT
+    if offset <= 30:
+        return INTERVAL_MID
+    return INTERVAL_FAR
+
+
+def has_priority_state_for_date(date, booking_state):
+    for record in booking_state.values():
+        if not isinstance(record, dict):
+            continue
+        if record.get("date") != date:
+            continue
+        if record.get("status") in {"PREPARING", "SOLD_OUT"}:
+            return True
+    return False
+
+
+def interval_for_date(date, booking_state):
+    today = now_kst().date()
+    target = datetime.strptime(date, "%Y%m%d").date()
+    offset = max(0, (target - today).days)
+    base = base_interval_for_offset(offset)
+
+    if has_priority_state_for_date(date, booking_state):
+        return min(base, PRIORITY_INTERVAL)
+
+    return base
+
+
+def merged_event_cache(date_event_cache):
+    merged = {}
+    for events in date_event_cache.values():
+        if isinstance(events, dict):
+            merged.update(events)
+    return merged
+
+
+def stagger_schedule(dates, booking_state, start_at=None):
+    """같은 주기의 날짜들이 한 순간에 몰리지 않도록 고르게 분산한다."""
+    if start_at is None:
+        start_at = time.monotonic()
+
+    groups = {}
+    for date in dates:
+        interval = interval_for_date(date, booking_state)
+        groups.setdefault(interval, []).append(date)
+
+    next_due = {}
+    for interval, group_dates in groups.items():
+        count = max(1, len(group_dates))
+        spacing = interval / count
+        for index, date in enumerate(group_dates):
+            next_due[date] = start_at + (index * spacing)
+
+    return next_due
+
+
+def run_initial_monitor_scan(session, seen, booking_state):
+    """감시 시작 시 50일을 딱 한 번 훑어 캐시를 만든다."""
+    date_event_cache = {}
+    dates = make_dates()
+    alerts = 0
+    soldout = 0
+    errors = 0
+    rate_limited = False
+    last_request_started = 0.0
+
+    scan_started = time.monotonic()
+
+    for index, date in enumerate(dates, start=1):
+        now = time.monotonic()
+        gap_wait = MIN_REQUEST_GAP - (now - last_request_started)
+        if gap_wait > 0:
+            time.sleep(gap_wait)
+        last_request_started = time.monotonic()
+
+        events, error = check_one_date(session, date)
+
+        if error:
+            errors += 1
+            if "HTTP 429" in error:
+                print(
+                    "⚠️ CGV API 제한(429) 감지 - "
+                    f"{RATE_LIMIT_COOLDOWN:.0f}초 쉬고 분산 감시로 전환합니다."
+                )
+                rate_limited = True
+                break
+
+            print(f"❌ CGV API 오류 | {error}")
+            continue
+
+        date_event_cache[date] = events
+
+        for key, event in events.items():
+            a, s = process_event(key, event, seen, booking_state)
+            alerts += a
+            soldout += s
+
+        if index % 10 == 0:
+            print(f"⏳ 첫 감시 준비: {index}/50 날짜 확인 완료")
+
+    elapsed = time.monotonic() - scan_started
+    counts = count_targets(merged_event_cache(date_event_cache))
+
+    if not rate_limited:
+        print(
+            "✅ 첫 50일 감시 확인 완료 | "
+            f"{elapsed:.2f}초 | "
+            f"GV {counts['GV']} | 무대인사 {counts['무대인사']} | "
+            f"IMAX {counts['IMAX']} | 4DX {counts['4DX']}"
+        )
+
+    return date_event_cache, alerts, soldout, errors, rate_limited
+
+
 def run_monitor(session, seen, booking_state, program_started):
-    cycle_number = 0
+    dates = make_dates()
     report_started = time.monotonic()
-    window_cycles = 0
+    window_requests = 0
+    window_success = 0
     window_alerts = 0
     window_soldout = 0
     window_errors = 0
-    latest_counts = {"GV": 0, "무대인사": 0, "IMAX": 0, "4DX": 0}
-    first_cycle_reported = False
+    total_requests = 0
+    last_request_started = 0.0
+
+    date_event_cache, init_alerts, init_soldout, init_errors, rate_limited = (
+        run_initial_monitor_scan(session, seen, booking_state)
+    )
+    window_alerts += init_alerts
+    window_soldout += init_soldout
+    window_errors += init_errors
+
+    save_seen(seen)
+    save_booking_state(booking_state)
+
+    now_mono = time.monotonic()
+    if rate_limited:
+        cooldown_until = now_mono + RATE_LIMIT_COOLDOWN
+        print(
+            f"⏸️ {RATE_LIMIT_COOLDOWN:.0f}초 API 휴식 후 "
+            "날짜별 분산 감시를 시작합니다."
+        )
+        next_due = stagger_schedule(
+            dates,
+            booking_state,
+            start_at=cooldown_until,
+        )
+    else:
+        next_due = stagger_schedule(
+            dates,
+            booking_state,
+            start_at=now_mono,
+        )
+
+    print(
+        "📡 날짜별 분산 감시 시작 | "
+        "오늘~+4일 60초 / +5~+14일 20초 / "
+        "+15~+30일 45초 / +31~+49일 5분 | "
+        "예매준비중·매진 날짜는 20초"
+    )
 
     while time.monotonic() - program_started < RUN_SECONDS:
-        cycle_number += 1
-        cycle_started = time.monotonic()
-        all_events = {}
-        cycle_alerts = 0
-        cycle_soldout = 0
-        cycle_error = None
-
-        for date in make_dates():
-            events, error = check_one_date(session, date)
-
-            if error:
-                cycle_error = error
-                window_errors += 1
-                print(f"❌ CGV API 오류 | {error}")
-                break
-
-            all_events.update(events)
-
-            # 날짜 응답이 도착하는 즉시 상태 변화/신규 회차 처리.
-            for key, event in events.items():
-                alerts, soldout_changes = process_event(
-                    key,
-                    event,
-                    seen,
-                    booking_state,
-                )
-                cycle_alerts += alerts
-                cycle_soldout += soldout_changes
-
-        save_seen(seen)
-        save_booking_state(booking_state)
-
-        cycle_elapsed = time.monotonic() - cycle_started
-
-        if cycle_error is None:
-            window_cycles += 1
-            window_alerts += cycle_alerts
-            window_soldout += cycle_soldout
-            latest_counts = count_targets(all_events)
-
-            if not first_cycle_reported:
-                print(
-                    "✅ 첫 50일 감시 사이클 완료 | "
-                    f"CYCLE #1 | {cycle_elapsed:.2f}초 | "
-                    f"GV {latest_counts['GV']} | "
-                    f"무대인사 {latest_counts['무대인사']} | "
-                    f"IMAX {latest_counts['IMAX']} | "
-                    f"4DX {latest_counts['4DX']}"
-                )
-                first_cycle_reported = True
-
         now_mono = time.monotonic()
-        if now_mono - report_started >= SUMMARY_SECONDS:
-            print(
-                "💚 정상 감시중 | "
-                f"최근 10분 {window_cycles}사이클 완료 | "
-                f"누적 CYCLE #{cycle_number} | "
-                f"GV {latest_counts['GV']} | "
-                f"무대인사 {latest_counts['무대인사']} | "
-                f"IMAX {latest_counts['IMAX']} | "
-                f"4DX {latest_counts['4DX']} | "
-                f"Discord 알림 {window_alerts} | "
-                f"매진변화 {window_soldout} | "
-                f"오류 {window_errors}"
-            )
-            report_started = now_mono
-            window_cycles = 0
-            window_alerts = 0
-            window_soldout = 0
-            window_errors = 0
-
-        elapsed_total = time.monotonic() - program_started
+        elapsed_total = now_mono - program_started
         remaining = RUN_SECONDS - elapsed_total
         if remaining <= 0:
             break
 
-        wait_time = max(0.0, TARGET_CYCLE_SECONDS - cycle_elapsed)
-        wait_time = min(wait_time, remaining)
+        # 10분 요약 시점이면 조회보다 먼저 요약을 출력한다.
+        if now_mono - report_started >= SUMMARY_SECONDS:
+            counts = count_targets(merged_event_cache(date_event_cache))
+            status_icon = "💚" if window_errors == 0 else "⚠️"
+            status_text = "정상 감시중" if window_errors == 0 else "감시중(API 오류 있음)"
+            print(
+                f"{status_icon} {status_text} | "
+                f"최근 10분 날짜조회 {window_requests}회 / 성공 {window_success}회 | "
+                f"누적 조회 {total_requests}회 | "
+                f"GV {counts['GV']} | 무대인사 {counts['무대인사']} | "
+                f"IMAX {counts['IMAX']} | 4DX {counts['4DX']} | "
+                f"Discord 알림 {window_alerts} | "
+                f"매진변화 {window_soldout} | 오류 {window_errors}"
+            )
+            report_started = now_mono
+            window_requests = 0
+            window_success = 0
+            window_alerts = 0
+            window_soldout = 0
+            window_errors = 0
+            continue
 
-        if wait_time > 0:
-            time.sleep(wait_time)
+        due_date = min(next_due, key=next_due.get)
+        due_at = next_due[due_date]
+
+        if due_at > now_mono:
+            until_due = due_at - now_mono
+            until_report = max(0.0, SUMMARY_SECONDS - (now_mono - report_started))
+            sleep_for = min(until_due, until_report, remaining, 1.0)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            continue
+
+        # API 요청 시작 자체도 최소 간격을 둬서 순간 버스트를 막는다.
+        gap_wait = MIN_REQUEST_GAP - (time.monotonic() - last_request_started)
+        if gap_wait > 0:
+            time.sleep(min(gap_wait, remaining))
+        last_request_started = time.monotonic()
+
+        events, error = check_one_date(session, due_date)
+        total_requests += 1
+        window_requests += 1
+
+        if error:
+            window_errors += 1
+
+            if "HTTP 429" in error:
+                print(
+                    "⚠️ CGV API 제한(429) 감지 - "
+                    f"{RATE_LIMIT_COOLDOWN:.0f}초 전체 휴식 후 분산 재개"
+                )
+                cooldown_until = time.monotonic() + RATE_LIMIT_COOLDOWN
+                next_due = stagger_schedule(
+                    dates,
+                    booking_state,
+                    start_at=cooldown_until,
+                )
+                continue
+
+            print(f"❌ CGV API 오류 | {error}")
+            next_due[due_date] = (
+                time.monotonic()
+                + interval_for_date(due_date, booking_state)
+            )
+            continue
+
+        window_success += 1
+        date_event_cache[due_date] = events
+
+        cycle_alerts = 0
+        cycle_soldout = 0
+        for key, event in events.items():
+            alerts, soldout_changes = process_event(
+                key,
+                event,
+                seen,
+                booking_state,
+            )
+            cycle_alerts += alerts
+            cycle_soldout += soldout_changes
+
+        window_alerts += cycle_alerts
+        window_soldout += cycle_soldout
+
+        save_seen(seen)
+        save_booking_state(booking_state)
+
+        # 방금 상태가 PREPARING/SOLD_OUT으로 바뀌었으면 그 날짜는 자동 20초 승격.
+        next_due[due_date] = (
+            time.monotonic()
+            + interval_for_date(due_date, booking_state)
+        )
 
     save_seen(seen)
     save_booking_state(booking_state)
 
     print(
         "✅ CGV 감시 종료 | "
-        f"누적 CYCLE #{cycle_number} | "
-        f"다음 정규 실행에 상태를 이어갑니다."
+        f"누적 날짜조회 {total_requests}회 | "
+        "다음 정규 실행에 상태를 이어갑니다."
     )
 
 
@@ -930,13 +1116,16 @@ def main():
     print("BRANCH:", SITE_NAME)
     print("TARGET: GV / 무대인사 / IMAX / 4DX")
     print("DATE RANGE: TODAY ~ +49 DAYS (50 DAYS TOTAL)")
-    print("SCAN MODE: 50 DAYS / SEQUENTIAL / 1 REQUEST AT A TIME")
-    print(f"FIXED CYCLE TARGET: {TARGET_CYCLE_SECONDS:.0f}s")
+    print("SCAN MODE: 50 DAYS / DATE-BY-DATE STAGGERED")
+    print("INTERVAL: +0~+4일 60s / +5~+14일 20s / +15~+30일 45s / +31~+49일 300s")
+    print("PRIORITY: 예매준비중 또는 매진이 잡힌 날짜는 20s")
+    print(f"MIN REQUEST START GAP: {MIN_REQUEST_GAP:.2f}s")
+    print(f"HTTP 429: {RATE_LIMIT_COOLDOWN:.0f}s 전체 휴식 후 분산 재개")
     print("EARLY DETECTION: 화면 표시 전이라도 CGV API에 대상 회차/종류가 있으면 추적")
     print("PREPARING: '예매준비중' 문구 또는 cntlYn=Y 감지")
     print("OPEN: 명시적 잔여좌석 > 0")
     print("REOPEN: 매진 -> 다시 좌석 발생 시 '좌석이 생겼습니다'")
-    print("LOG MODE: 기준값 10/20/30/40/50 진행 + 정상 감시는 10분 요약")
+    print("LOG MODE: 기준값/첫확인 진행 + 정상 감시는 10분 요약")
     print("RUN SECONDS:", RUN_SECONDS)
     print("KST NOW:", now_kst().strftime("%Y-%m-%d %H:%M:%S"))
     print("=" * 72)
