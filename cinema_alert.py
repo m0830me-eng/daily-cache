@@ -26,8 +26,8 @@ SITE_NAME = "CGV 용산아이파크몰"
 DAYS = 50
 
 # 날짜별 요청 분산: 공개 CGV 알리미 방식 참고
-DATE_REQUEST_MIN_SECONDS = 0.8
-DATE_REQUEST_MAX_SECONDS = 1.2
+DATE_REQUEST_MIN_SECONDS = 0.3
+DATE_REQUEST_MAX_SECONDS = 0.5
 START_DELAY = float(os.environ.get("START_DELAY", "0"))
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "120"))
 
