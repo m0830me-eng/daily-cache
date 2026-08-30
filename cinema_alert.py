@@ -3,17 +3,20 @@ import sys
 import json
 import re
 import time
+import random
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from curl_cffi import requests
 
+# GitHub Actions에서도 로그를 즉시 표시
 try:
     sys.stdout.reconfigure(line_buffering=True, write_through=True)
     sys.stderr.reconfigure(line_buffering=True, write_through=True)
 except Exception:
     pass
+
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -21,10 +24,12 @@ SITE_NO = "0013"
 SITE_NAME = "CGV 용산아이파크몰"
 
 DAYS = 50
-TARGET_CYCLE_SECONDS = 19.0
 
+# 날짜별 요청 분산: 공개 CGV 알리미 방식 참고
+DATE_REQUEST_MIN_SECONDS = 0.8
+DATE_REQUEST_MAX_SECONDS = 1.2
 START_DELAY = float(os.environ.get("START_DELAY", "0"))
-RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "19200"))
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "120"))
 
 BOOKING_PAGE = "https://cgv.co.kr/cnm/movieBook"
 API_URL = "https://cgv.co.kr/api/v1/booking/searchMovScnInfo"
@@ -32,9 +37,11 @@ API_URL = "https://cgv.co.kr/api/v1/booking/searchMovScnInfo"
 STATE_FILE = "seen_cgv_yongsan.json"
 BASELINE_FILE = "baseline_cgv_yongsan.done"
 
-CY_WEBHOOK = os.environ.get("CY_WEBHOOK", "")
-DISCORD_MENTION_ID = os.environ.get("DISCORD_MENTION_ID", "").strip()
+GV_WEBHOOK = os.environ.get("DISCORD_CGV_YONGSAN_GV", "")
+STAGE_WEBHOOK = os.environ.get("DISCORD_CGV_YONGSAN_STAGE", "")
+DISCORD_USER_ID = "1383846907847381184"
 
+# 사용자 제공 실제 용산 4DX 예매 링크에서 확인된 상영관 번호
 YONGSAN_4DX_SCNS_NO = "003"
 
 HEADERS = {
@@ -67,23 +74,21 @@ def all_row_text(value):
     return " | ".join(parts)
 
 
-def send_discord(message):
-    if not CY_WEBHOOK:
+def send_discord(webhook, message):
+    if not webhook:
         print("WEBHOOK MISSING")
         return False
 
     try:
-        payload = {
-            "content": message,
-            "flags": 4,
-            "allowed_mentions": {
-                "users": [DISCORD_MENTION_ID] if DISCORD_MENTION_ID else []
-            },
-        }
-
         r = requests.post(
-            CY_WEBHOOK,
-            json=payload,
+            webhook,
+            json={
+                "content": message,
+                "flags": 4,
+                "allowed_mentions": {
+                    "users": [DISCORD_USER_ID]
+                },
+            },
             impersonate="chrome",
             timeout=15,
         )
@@ -227,6 +232,7 @@ def detect_format(row):
     format_upper = format_text.upper()
     full_upper = full_text.upper()
 
+    # 용산 4DX는 실제 예매 링크에서 scnsNo=003 확인됨.
     if (
         "4DX" in format_upper
         or "4DX" in full_upper
@@ -246,6 +252,7 @@ def detect_format(row):
 
 
 def get_target_type(row):
+    # GV/무대인사 회차가 특별관이어도 이벤트 알림을 우선해 중복 알림 방지.
     event_type = detect_event_type(row)
     if event_type:
         return event_type
@@ -269,10 +276,8 @@ def extract_rows(data):
             )
             if looks_like_show:
                 rows.append(item)
-
             for value in item.values():
                 walk(value)
-
         elif isinstance(item, list):
             for value in item:
                 walk(value)
@@ -286,7 +291,6 @@ def check_one_date(session, date):
 
     try:
         started = time.monotonic()
-
         r = session.get(
             API_URL,
             params={
@@ -298,7 +302,6 @@ def check_one_date(session, date):
             headers=HEADERS,
             timeout=20,
         )
-
         elapsed = time.monotonic() - started
 
         print(
@@ -322,7 +325,6 @@ def check_one_date(session, date):
                 continue
 
             key = event_key(date, row, target_type)
-
             events[key] = {
                 "date": date,
                 "type": target_type,
@@ -345,7 +347,6 @@ def check_one_date(session, date):
 
 def make_dates():
     today = datetime.now(KST)
-
     return [
         (today + timedelta(days=i)).strftime("%Y%m%d")
         for i in range(DAYS)
@@ -398,8 +399,33 @@ def send_new_events(events, seen):
 
     for item in new_events:
         event = item["event"]
-        group_key = (event["date"], event["type"])
-        groups.setdefault(group_key, {"items": []})["items"].append(item)
+
+        if event["type"] == "IMAX":
+            group_type = "IMAX"
+            title = "새로운 용산 IMAX 상영 일정"
+            webhook = GV_WEBHOOK
+        elif event["type"] == "4DX":
+            group_type = "4DX"
+            title = "새로운 용산 4DX 상영 일정"
+            webhook = GV_WEBHOOK
+        elif event["type"] == "GV":
+            group_type = "GV"
+            title = "새로운 용산 GV 상영 일정"
+            webhook = GV_WEBHOOK
+        else:
+            group_type = "무대인사"
+            title = "새로운 용산 무대인사 상영 일정"
+            webhook = STAGE_WEBHOOK
+
+        group_key = (event["date"], group_type)
+        groups.setdefault(
+            group_key,
+            {
+                "title": title,
+                "webhook": webhook,
+                "items": [],
+            },
+        )["items"].append(item)
 
     sent_count = 0
 
@@ -411,18 +437,20 @@ def send_new_events(events, seen):
             )
         )
 
-        mention = f"<@{DISCORD_MENTION_ID}>\n\n" if DISCORD_MENTION_ID else ""
-
         lines = [
-            mention + f"🎬 **CGV 용산아이파크몰 · {group_type}**",
+            f"<@{DISCORD_USER_ID}>",
+            "",
+            f"🎉 **{group['title']}** 🎉",
+            "",
             f"📅 **{pretty_date(date)}**",
         ]
 
         for item in group["items"]:
             event = item["event"]
-            screen = event["screen"] or group_type
+            screen_suffix = f" | {event['screen']}" if event["screen"] else ""
             lines.append(
-                f"• 🎟️ [{item['start']} — {event['movie']} | {screen}]({item['link']})"
+                f"• 🎟️ [{item['start']} — {event['movie']}{screen_suffix}]"
+                f"({item['link']})"
             )
 
         print(
@@ -433,7 +461,7 @@ def send_new_events(events, seen):
             len(group["items"]),
         )
 
-        if send_discord("\n".join(lines)):
+        if send_discord(group["webhook"], "\n".join(lines)):
             for item in group["items"]:
                 seen.add(item["key"])
                 sent_count += 1
@@ -441,79 +469,117 @@ def send_new_events(events, seen):
     return sent_count
 
 
+def distributed_wait():
+    wait_seconds = random.uniform(
+        DATE_REQUEST_MIN_SECONDS,
+        DATE_REQUEST_MAX_SECONDS,
+    )
+    print(f"NEXT DATE WAIT: {wait_seconds:.2f}s")
+    time.sleep(wait_seconds)
+
+
 def collect_baseline(session):
     all_events = {}
+    blocked_dates = []
+    dates = make_dates()
 
-    for date in make_dates():
+    for index, date in enumerate(dates):
         events = check_one_date(session, date)
-
         if events is None:
-            return None
+            blocked_dates.append(date)
+        else:
+            all_events.update(events)
 
-        all_events.update(events)
+        if index < len(dates) - 1:
+            distributed_wait()
+
+    if blocked_dates:
+        print(
+            "BASELINE BLOCKED DATES:",
+            len(blocked_dates),
+            "/",
+            DAYS,
+            "- 기준값 생성은 다음 실행에서 다시 시도합니다.",
+        )
+        return None
 
     return all_events
 
 
-def scan_cycle(session, seen, cycle_number, target_cycle_seconds):
+def scan_cycle(session, seen, cycle_number):
     cycle_started = time.monotonic()
     all_events = {}
-    date_count = 0
+    success_count = 0
     new_total = 0
-    blocked_date = None
+    blocked_dates = []
+    dates = make_dates()
 
     print()
     print("=" * 70)
     print(
         f"CYCLE #{cycle_number} START | "
         f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} KST | "
-        f"50 DAYS | SEQUENTIAL | TARGET={target_cycle_seconds:.0f}s"
+        f"50 DAYS | DISTRIBUTED SEQUENTIAL | "
+        f"DATE GAP={DATE_REQUEST_MIN_SECONDS:.1f}~"
+        f"{DATE_REQUEST_MAX_SECONDS:.1f}s"
     )
     print("=" * 70)
 
-    for date in make_dates():
+    for index, date in enumerate(dates):
         events = check_one_date(session, date)
 
         if events is None:
-            blocked_date = date
-            break
+            blocked_dates.append(date)
+            print(
+                f"SKIP BLOCKED DATE: {date} - "
+                "다음 날짜 감시를 계속합니다."
+            )
+        else:
+            success_count += 1
+            all_events.update(events)
 
-        date_count += 1
-        all_events.update(events)
+            # 날짜 응답이 도착한 즉시 새 회차를 Discord로 보냄.
+            new_total += send_new_events(events, seen)
 
-        new_total += send_new_events(events, seen)
+        # 50개 요청을 한꺼번에 몰아치지 않도록 날짜 사이를 분산.
+        if index < len(dates) - 1:
+            distributed_wait()
 
     save_seen(seen)
 
     cycle_elapsed = time.monotonic() - cycle_started
 
-    if blocked_date:
+    print_target_counts(all_events)
+    print(
+        f"CYCLE #{cycle_number} DONE | "
+        f"SUCCESS={success_count}/{DAYS} | "
+        f"BLOCKED={len(blocked_dates)} | "
+        f"NEW={new_total} | "
+        f"ELAPSED={cycle_elapsed:.2f}s"
+    )
+
+    if blocked_dates:
         print(
-            f"CYCLE #{cycle_number} BLOCKED | "
-            f"DATE={blocked_date} | "
-            f"DATES={date_count}/{DAYS} | "
-            f"NEW={new_total} | "
-            f"ELAPSED={cycle_elapsed:.2f}s"
+            "BLOCKED DATES:",
+            ", ".join(blocked_dates),
         )
-    else:
-        print_target_counts(all_events)
         print(
-            f"CYCLE #{cycle_number} DONE | "
-            f"DATES={date_count}/{DAYS} | "
-            f"NEW={new_total} | "
-            f"ELAPSED={cycle_elapsed:.2f}s"
+            "긴 쿨다운 없이 다음 사이클에서 다시 확인합니다."
         )
 
-    return blocked_date is not None, blocked_date, cycle_elapsed
-
+    return len(blocked_dates), cycle_elapsed
 
 def main():
     print("=" * 70)
-    print("CGV YONGSAN 50-DAY FIXED 19s MONITOR")
+    print("CGV YONGSAN 50-DAY DISTRIBUTED MONITOR")
     print("TARGET: GV / STAGE / IMAX / 4DX")
     print("DATE RANGE: TODAY ~ +49 DAYS (50 DAYS TOTAL)")
-    print("SCAN MODE: SEQUENTIAL / 1 REQUEST AT A TIME")
-    print(f"FIXED CYCLE: {TARGET_CYCLE_SECONDS:.0f} SECONDS")
+    print("SCAN MODE: 1 DATE AT A TIME / DISTRIBUTED SEQUENTIAL")
+    print(
+        f"DATE REQUEST GAP: {DATE_REQUEST_MIN_SECONDS:.1f}~"
+        f"{DATE_REQUEST_MAX_SECONDS:.1f} SECONDS"
+    )
+    print("429/403/503: BLOCKED DATE만 건너뛰고 다음 날짜 계속 감시")
     print("4DX FALLBACK: YONGSAN scnsNo=003")
     print("RUN SECONDS:", RUN_SECONDS)
     print("=" * 70)
@@ -527,11 +593,9 @@ def main():
     try:
         r = session.get(BOOKING_PAGE, timeout=20)
         print("BOOKING PAGE STATUS:", r.status_code)
-
         if r.status_code != 200:
             print("CGV BOOKING PAGE ERROR")
             return
-
     except Exception as e:
         print("BOOKING PAGE ERROR:", repr(e))
         return
@@ -547,57 +611,36 @@ def main():
         )
 
         events = collect_baseline(session)
-
         if events is None:
             print("BASELINE FAILED: CGV RATE LIMIT / BLOCK")
             return
 
         print_target_counts(events)
-
         seen = set(events.keys())
-
         print("BASELINE EVENT COUNT:", len(seen))
-
         save_seen(seen)
         mark_baseline_done()
-
         print("BASELINE COMPLETE - 이번 실행에서는 Discord 알림을 보내지 않았습니다.")
         return
 
     seen = load_seen()
-
     monitor_started = time.monotonic()
     cycle_number = 0
 
     while time.monotonic() - monitor_started < RUN_SECONDS:
         cycle_number += 1
 
-        blocked, blocked_date, cycle_elapsed = scan_cycle(
+        blocked_count, cycle_elapsed = scan_cycle(
             session,
             seen,
             cycle_number,
-            TARGET_CYCLE_SECONDS,
         )
 
-        if blocked:
-            print(
-                f"FIXED 19s MODE: BLOCKED ON {blocked_date} - "
-                "KEEPING 19s AND RETRYING NEXT CYCLE"
-            )
-
-        wait_time = max(0.0, TARGET_CYCLE_SECONDS - cycle_elapsed)
-
-        if wait_time > 0:
-            print(
-                f"WAIT {wait_time:.2f}s TO KEEP "
-                f"{TARGET_CYCLE_SECONDS:.0f}s CYCLE"
-            )
-            time.sleep(wait_time)
-        else:
-            print(
-                f"CYCLE TOOK >= {TARGET_CYCLE_SECONDS:.0f}s "
-                "- START NEXT CYCLE IMMEDIATELY"
-            )
+        print(
+            f"NEXT CYCLE IMMEDIATELY | "
+            f"PREVIOUS={cycle_elapsed:.2f}s | "
+            f"BLOCKED={blocked_count}"
+        )
 
     save_seen(seen)
     print("FINAL SEEN STATE:", len(seen))
