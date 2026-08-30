@@ -2,13 +2,17 @@ name: CGV Yongsan Auto Speed Test
 
 on:
   workflow_dispatch:
+
   schedule:
     # KST 06:02
     - cron: "2 21 * * *"
+
     # KST 11:32
     - cron: "32 2 * * *"
+
     # KST 17:02
     - cron: "2 8 * * *"
+
     # KST 22:32
     - cron: "32 13 * * *"
 
@@ -36,14 +40,16 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
 
       - name: Set monitoring duration
         id: duration
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "seconds=120" >> "$GITHUB_OUTPUT"
+            # 수동 안정성 테스트: 30분
+            echo "seconds=1800" >> "$GITHUB_OUTPUT"
           else
             case "${{ github.event.schedule }}" in
               "2 21 * * *")
@@ -59,7 +65,7 @@ jobs:
                 echo "seconds=5220" >> "$GITHUB_OUTPUT"
                 ;;
               *)
-                echo "seconds=120" >> "$GITHUB_OUTPUT"
+                echo "seconds=1800" >> "$GITHUB_OUTPUT"
                 ;;
             esac
           fi
@@ -69,7 +75,8 @@ jobs:
           CY_WEBHOOK: ${{ secrets.CY_WEBHOOK }}
           DISCORD_MENTION_ID: ${{ secrets.DISCORD_MENTION_ID }}
           RUN_SECONDS: ${{ steps.duration.outputs.seconds }}
-        run: python -u cinema_alert.py
+        run: |
+          python -u cinema_alert.py
 
       - name: Save state
         if: always()
