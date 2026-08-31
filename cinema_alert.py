@@ -610,65 +610,54 @@ def detected_title(event_type):
 
 def notification_title(event_type, alert_kind):
     if alert_kind == "PREPARING":
-        return f"⏳ {SITE_NAME} {event_type} · 예매 준비중"
+        return "⏳ 예매준비중"
     if alert_kind == "OPEN":
-        return f"🚨 {SITE_NAME} {event_type} · 예매 오픈"
-    if alert_kind == "REOPEN":
-        return f"🎟️ {SITE_NAME} {event_type} · 취소표가 생겼습니다"
-    return detected_title(event_type)
+        return "🎟️ 예매가 열렸습니다"
+
+    if event_type == "GV":
+        return "🔎 GV가 감지됐습니다"
+    if event_type == "무대인사":
+        return "🔎 무대인사가 감지됐습니다"
+    if event_type == "IMAX":
+        return "🔎 IMAX가 감지됐습니다"
+    if event_type == "4DX":
+        return "🔎 4DX가 감지됐습니다"
+
+    return "🔎 특별 상영 일정이 감지됐습니다"
 
 
 def send_event_alert(event, alert_kind):
+    start = pretty_time(event.get("time", ""))
+    movie = event.get("movie", "") or "영화명 미확인"
+    screen = event.get("screen", "")
+    event_type = event.get("type", "")
+    link = event.get("link", "")
+
     lines = []
 
     if DISCORD_USER_ID:
         lines.append(f"<@{DISCORD_USER_ID}>")
-        lines.append("")
 
     lines.extend([
-        f"**{notification_title(event['type'], alert_kind)}**",
-        "",
-        f"📅 **{pretty_date(event['date'])}**",
+        notification_title(event_type, alert_kind),
+        f"[🎬 {SITE_NAME} · {event_type}]({link})",
+        f"📅 {pretty_date(event['date'])}",
     ])
 
-    start = pretty_time(event.get("time", ""))
-    movie = event.get("movie", "") or "영화명 미확인"
-    screen = event.get("screen", "")
-    linked_movie = f"[{movie}]({event['link']})"
-
     if screen:
-        lines.append(f"🎟️ {start} · {linked_movie} · {screen}")
+        lines.append(f"🎟 {start} · {movie} · {screen}")
     else:
-        lines.append(f"🎟️ {start} · {linked_movie}")
+        lines.append(f"🎟 {start} · {movie}")
 
     ok = send_discord(
-        webhook_for_type(event["type"]),
+        webhook_for_type(event_type),
         "\n".join(lines),
     )
 
     if ok:
-        label = {
-            "PREPARING": "예매 준비중",
-            "OPEN": "예매 오픈",
-            "REOPEN": "취소표가 생겼습니다",
-        }.get(alert_kind)
-
-        if alert_kind == "NEW":
-            if event["type"] == "GV":
-                label = "GV가 감지됐습니다"
-            elif event["type"] == "무대인사":
-                label = "무대인사가 감지됐습니다"
-            elif event["type"] == "IMAX":
-                label = "IMAX가 감지됐습니다"
-            elif event["type"] == "4DX":
-                label = "4DX가 감지됐습니다"
-            else:
-                label = "특별 상영 일정이 감지됐습니다"
-
-        if label is None:
-            label = alert_kind
+        label = notification_title(event_type, alert_kind)
         print(
-            f"🔔 {label} | {event['date']} | {event['type']} | "
+            f"🔔 {label} | {event['date']} | {event_type} | "
             f"{start} | {movie} | {screen}"
         )
 
@@ -678,6 +667,9 @@ def send_event_alert(event, alert_kind):
 def process_event(key, event, seen, booking_state):
     """
     Returns: (discord_alerts, soldout_changes)
+
+    SOLD_OUT은 내부 상태 판별용으로만 저장한다.
+    사용자 로그/Discord에는 매진이나 취소표 알림을 보내지 않는다.
     """
     current = event.get("status", "UNKNOWN")
     previous_record = booking_state.get(key)
@@ -691,7 +683,6 @@ def process_event(key, event, seen, booking_state):
     alerts = 0
     soldout_changes = 0
 
-    # 현재 상태를 확실히 알 수 없으면 기존 확정 상태를 지우지 않는다.
     if current == "UNKNOWN":
         if is_new_key:
             if send_event_alert(event, "NEW"):
@@ -700,15 +691,11 @@ def process_event(key, event, seen, booking_state):
                 alerts += 1
         return alerts, soldout_changes
 
-    # 최초 발견이 이미 매진이면 알림 없이 기억만 한다.
+    # 최초 발견이 이미 매진이면 사용자에게 알리지 않고 내부 상태만 기억.
     if current == "SOLD_OUT" and is_new_key:
         seen.add(key)
         booking_state[key] = state_record(event, "SOLD_OUT")
-        print(
-            f"🔒 매진 상태 저장 | {event['date']} | {event['type']} | "
-            f"{pretty_time(event['time'])} | {event['movie']}"
-        )
-        return alerts, 1
+        return alerts, soldout_changes
 
     # 새 회차가 준비중/오픈 상태로 처음 API에 등장.
     if is_new_key:
@@ -719,17 +706,13 @@ def process_event(key, event, seen, booking_state):
             alerts += 1
         return alerts, soldout_changes
 
-    # 이미 알려진 회차인데 새 booking-state 파일에 기록이 없는 경우:
-    # 기존 상태를 UNKNOWN으로 보고 확정 상태가 생겼을 때만 알린다.
     if previous_record is None:
         previous = "UNKNOWN"
 
-    # 같은 상태면 조용히 최신 메타데이터만 갱신.
     if current == previous:
         booking_state[key] = state_record(event, current)
         return alerts, soldout_changes
 
-    # 불명확 -> 준비중/오픈: 상태가 처음 확실해진 순간 알림.
     if previous == "UNKNOWN" and current in {"PREPARING", "OPEN"}:
         alert_kind = "PREPARING" if current == "PREPARING" else "OPEN"
         if send_event_alert(event, alert_kind):
@@ -737,38 +720,23 @@ def process_event(key, event, seen, booking_state):
             alerts += 1
         return alerts, soldout_changes
 
-    # 준비중 -> 오픈
     if previous == "PREPARING" and current == "OPEN":
         if send_event_alert(event, "OPEN"):
             booking_state[key] = state_record(event, "OPEN")
             alerts += 1
         return alerts, soldout_changes
 
-    # 오픈/준비중/불명확 -> 매진: Discord는 보내지 않고 상태만 기억.
-    if current == "SOLD_OUT" and previous != "SOLD_OUT":
+    # 어떤 상태든 -> 매진: 사용자에게는 아무것도 보여주지 않고 내부 상태만 갱신.
+    if current == "SOLD_OUT":
         booking_state[key] = state_record(event, "SOLD_OUT")
-        soldout_changes += 1
-        print(
-            f"🔒 매진 상태 저장 | {event['date']} | {event['type']} | "
-            f"{pretty_time(event['time'])} | {event['movie']}"
-        )
         return alerts, soldout_changes
 
-    # 매진 -> 다시 예매 가능 = 취소표 발생.
-    # IMAX / 4DX는 취소표 Discord 알림을 보내지 않고 상태만 갱신한다.
+    # 매진 -> OPEN: 취소표 알림 없이 내부 상태만 변경.
     if previous == "SOLD_OUT" and current == "OPEN":
-        if event.get("type") in {"IMAX", "4DX"}:
-            booking_state[key] = state_record(event, "OPEN")
-            return alerts, soldout_changes
-
-        if send_event_alert(event, "REOPEN"):
-            booking_state[key] = state_record(event, "OPEN")
-            alerts += 1
+        booking_state[key] = state_record(event, "OPEN")
         return alerts, soldout_changes
 
-    # SOLD_OUT -> PREPARING은 매진 기억을 유지한다.
-    # OPEN -> PREPARING도 일시적인 제어 플래그로 보고 OPEN 기억을 유지해
-    # 다시 OPEN이 됐을 때 중복 예매오픈 알림이 생기지 않게 한다.
+    # OPEN/SOLD_OUT 뒤 PREPARING 흔들림은 기존 확정 상태 기억 유지.
     if current == "PREPARING" and previous in {"SOLD_OUT", "OPEN"}:
         return alerts, soldout_changes
 
@@ -893,7 +861,7 @@ def has_priority_state_for_date(date, booking_state):
             continue
         if record.get("date") != date:
             continue
-        if record.get("status") in {"PREPARING", "SOLD_OUT"}:
+        if record.get("status") == "PREPARING":
             return True
     return False
 
@@ -1014,7 +982,7 @@ def run_0030_fast_scan(seen, booking_state, date_event_cache):
         f"{icon} {now_kst().strftime('%H:%M')} 00/30 동시스캔 완료 | "
         f"+4~+21일 | 성공 {success}/{len(dates)} | "
         f"{elapsed:.2f}초 | Discord 알림 {alerts} | "
-        f"매진변화 {soldout_changes} | 오류 {errors}"
+        f"오류 {errors}"
     )
 
     return success, errors, alerts, soldout_changes
@@ -1122,7 +1090,7 @@ def run_monitor(session, seen, booking_state, program_started):
         "📡 날짜별 분산 감시 시작 | "
         "오늘 5분 / 내일(+1) 20초 / +2~+4일 90초 / "
         "+5~+14일 30초 / +15~+30일 60초 / +31~+42일 5분 | "
-        "예매준비중·매진 날짜는 20초"
+        "예매준비중 날짜는 20초"
     )
     print(
         "⚡ 고정 동시스캔 | 매시 00분 / 30분 | "
@@ -1167,8 +1135,7 @@ def run_monitor(session, seen, booking_state, program_started):
                 f"누적 조회 {total_requests}회 | "
                 f"GV {counts['GV']} | 무대인사 {counts['무대인사']} | "
                 f"IMAX {counts['IMAX']} | 4DX {counts['4DX']} | "
-                f"Discord 알림 {window_alerts} | "
-                f"매진변화 {window_soldout} | 오류 {window_errors}"
+                f"Discord 알림 {window_alerts} | 오류 {window_errors}"
             )
             report_started = now_mono
             window_requests = 0
@@ -1243,7 +1210,7 @@ def run_monitor(session, seen, booking_state, program_started):
         save_seen(seen)
         save_booking_state(booking_state)
 
-        # 방금 상태가 PREPARING/SOLD_OUT으로 바뀌었으면 그 날짜는 자동 20초 승격.
+        # 방금 상태가 PREPARING으로 바뀌었으면 그 날짜는 자동 20초 승격.
         next_due[due_date] = (
             time.monotonic()
             + interval_for_date(due_date, booking_state)
@@ -1274,13 +1241,12 @@ def main():
     print(f"DATE RANGE: TODAY ~ +{DAYS - 1} DAYS ({DAYS} DAYS TOTAL)")
     print(f"SCAN MODE: {DAYS} DAYS / DATE-BY-DATE STAGGERED")
     print("INTERVAL: 오늘 300s / 내일(+1) 20s / +2~+4일 90s / +5~+14일 30s / +15~+30일 60s / +31~+42일 300s")
-    print("PRIORITY: 예매준비중 또는 매진이 잡힌 날짜는 20s")
+    print("PRIORITY: 예매준비중이 잡힌 날짜는 20s")
     print(f"MIN REQUEST START GAP: {MIN_REQUEST_GAP:.2f}s")
     print(f"HTTP 429: {RATE_LIMIT_COOLDOWN:.0f}s 전체 휴식 후 분산 재개")
     print("EARLY DETECTION: 화면 표시 전이라도 CGV API에 대상 회차/종류가 있으면 추적")
     print("PREPARING: '예매준비중' 문구 또는 cntlYn=Y 감지")
     print("OPEN: 명시적 잔여좌석 > 0")
-    print("REOPEN: 매진 -> 다시 좌석 발생 시 '취소표가 생겼습니다'")
     print("FAST SCAN: 매시 00/30분 +4~+21일 18일 / 18 workers 완전 동시")
     print("LOG MODE: 기준값/첫확인 진행 + 정상 감시는 10분 요약")
     print("RUN SECONDS:", RUN_SECONDS)
