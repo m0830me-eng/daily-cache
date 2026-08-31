@@ -88,9 +88,6 @@ HEADERS = {
 
 BLOCK_STATUSES = {403, 429, 500, 502, 503, 504}
 
-# 아직 분류 규칙에 없는 CGV 이벤트 신호를 학습하기 위한 진단 로그
-_UNKNOWN_SIGNAL_SEEN = set()
-_UNKNOWN_SIGNAL_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -375,65 +372,6 @@ def detect_format(row):
 
 
 
-def log_unknown_classification_signal(date, row):
-    """
-    일반 회차는 무시하고, 이벤트성 필드가 들어왔는데
-    GV/무대인사/IMAX/4DX로 아직 판별하지 못한 경우만
-    Discord가 아니라 Actions 로그에 학습용 정보를 남긴다.
-    """
-    eventish_fields = [
-        "videoAddexpCdNm",
-        "videoAddexpNm",
-        "videoAddexpCd",
-        "eventNm",
-        "eventName",
-        "specialEventNm",
-        "specialEventName",
-        "addexpNm",
-        "addexpName",
-    ]
-
-    signal = {
-        field: clean_text(row.get(field))
-        for field in eventish_fields
-        if clean_text(row.get(field))
-    }
-
-    if not signal:
-        return
-
-    identity = (
-        date,
-        str(row.get("movNo") or ""),
-        str(row.get("scnsNo") or ""),
-        str(row.get("scnSseq") or ""),
-        str(row.get("scnsrtTm") or ""),
-        tuple(sorted(signal.items())),
-    )
-
-    with _UNKNOWN_SIGNAL_LOCK:
-        if identity in _UNKNOWN_SIGNAL_SEEN:
-            return
-        _UNKNOWN_SIGNAL_SEEN.add(identity)
-
-    info = {
-        "movie": clean_text(row.get("movNm") or row.get("movName")),
-        "screen": clean_text(
-            row.get("scnsNm")
-            or row.get("scnsName")
-            or row.get("screenNm")
-            or row.get("screenName")
-        ),
-        "time": clean_text(row.get("scnsrtTm")),
-        "scnsNo": clean_text(row.get("scnsNo")),
-        "cntlYn": clean_text(row.get("cntlYn")),
-        "frSeatCnt": clean_text(row.get("frSeatCnt")),
-    }
-
-    print(
-        "🧪 분류 미확인 CGV 신호 | "
-        f"DATE={date} | SIGNAL={signal} | INFO={info}"
-    )
 
 def get_target_type(row):
     # 이벤트 회차가 특별관이어도 GV/무대인사를 우선해 중복 알림 방지.
@@ -643,7 +581,6 @@ def check_one_date(session, date):
         for row in rows:
             target_type = get_target_type(row)
             if not target_type:
-                log_unknown_classification_signal(date, row)
                 continue
 
             key = event_key(date, row, target_type)
