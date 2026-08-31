@@ -88,6 +88,10 @@ HEADERS = {
 
 BLOCK_STATUSES = {403, 429, 500, 502, 503, 504}
 
+# 아직 분류 규칙에 없는 CGV 이벤트 신호를 학습하기 위한 진단 로그
+_UNKNOWN_SIGNAL_SEEN = set()
+_UNKNOWN_SIGNAL_LOCK = threading.Lock()
+
 
 # ============================================================
 # Basic helpers
@@ -370,6 +374,67 @@ def detect_format(row):
     return None
 
 
+
+def log_unknown_classification_signal(date, row):
+    """
+    일반 회차는 무시하고, 이벤트성 필드가 들어왔는데
+    GV/무대인사/IMAX/4DX로 아직 판별하지 못한 경우만
+    Discord가 아니라 Actions 로그에 학습용 정보를 남긴다.
+    """
+    eventish_fields = [
+        "videoAddexpCdNm",
+        "videoAddexpNm",
+        "videoAddexpCd",
+        "eventNm",
+        "eventName",
+        "specialEventNm",
+        "specialEventName",
+        "addexpNm",
+        "addexpName",
+    ]
+
+    signal = {
+        field: clean_text(row.get(field))
+        for field in eventish_fields
+        if clean_text(row.get(field))
+    }
+
+    if not signal:
+        return
+
+    identity = (
+        date,
+        str(row.get("movNo") or ""),
+        str(row.get("scnsNo") or ""),
+        str(row.get("scnSseq") or ""),
+        str(row.get("scnsrtTm") or ""),
+        tuple(sorted(signal.items())),
+    )
+
+    with _UNKNOWN_SIGNAL_LOCK:
+        if identity in _UNKNOWN_SIGNAL_SEEN:
+            return
+        _UNKNOWN_SIGNAL_SEEN.add(identity)
+
+    info = {
+        "movie": clean_text(row.get("movNm") or row.get("movName")),
+        "screen": clean_text(
+            row.get("scnsNm")
+            or row.get("scnsName")
+            or row.get("screenNm")
+            or row.get("screenName")
+        ),
+        "time": clean_text(row.get("scnsrtTm")),
+        "scnsNo": clean_text(row.get("scnsNo")),
+        "cntlYn": clean_text(row.get("cntlYn")),
+        "frSeatCnt": clean_text(row.get("frSeatCnt")),
+    }
+
+    print(
+        "🧪 분류 미확인 CGV 신호 | "
+        f"DATE={date} | SIGNAL={signal} | INFO={info}"
+    )
+
 def get_target_type(row):
     # 이벤트 회차가 특별관이어도 GV/무대인사를 우선해 중복 알림 방지.
     event_type = detect_event_type(row)
@@ -578,6 +643,7 @@ def check_one_date(session, date):
         for row in rows:
             target_type = get_target_type(row)
             if not target_type:
+                log_unknown_classification_signal(date, row)
                 continue
 
             key = event_key(date, row, target_type)
@@ -593,14 +659,26 @@ def check_one_date(session, date):
 # Notifications / transitions
 # ============================================================
 
+def detected_title(event_type):
+    if event_type == "GV":
+        return f"🎬 {SITE_NAME} · GV가 감지됐습니다"
+    if event_type == "무대인사":
+        return f"🎬 {SITE_NAME} · 무대인사가 감지됐습니다"
+    if event_type == "IMAX":
+        return f"🎬 {SITE_NAME} · IMAX가 감지됐습니다"
+    if event_type == "4DX":
+        return f"🎬 {SITE_NAME} · 4DX가 감지됐습니다"
+    return f"🎬 {SITE_NAME} · 특별 상영 일정이 감지됐습니다"
+
+
 def notification_title(event_type, alert_kind):
     if alert_kind == "PREPARING":
         return f"⏳ {SITE_NAME} {event_type} · 예매 준비중"
     if alert_kind == "OPEN":
         return f"🚨 {SITE_NAME} {event_type} · 예매 오픈"
     if alert_kind == "REOPEN":
-        return f"🎟️ {SITE_NAME} {event_type} · 좌석이 생겼습니다"
-    return f"🎉 {SITE_NAME} {event_type} · 새 상영 일정"
+        return f"🎟️ {SITE_NAME} {event_type} · 취소표가 생겼습니다"
+    return detected_title(event_type)
 
 
 def send_event_alert(event, alert_kind):
@@ -635,9 +713,23 @@ def send_event_alert(event, alert_kind):
         label = {
             "PREPARING": "예매 준비중",
             "OPEN": "예매 오픈",
-            "REOPEN": "좌석 재발생",
-            "NEW": "새 상영 일정",
-        }.get(alert_kind, alert_kind)
+            "REOPEN": "취소표가 생겼습니다",
+        }.get(alert_kind)
+
+        if alert_kind == "NEW":
+            if event["type"] == "GV":
+                label = "GV가 감지됐습니다"
+            elif event["type"] == "무대인사":
+                label = "무대인사가 감지됐습니다"
+            elif event["type"] == "IMAX":
+                label = "IMAX가 감지됐습니다"
+            elif event["type"] == "4DX":
+                label = "4DX가 감지됐습니다"
+            else:
+                label = "특별 상영 일정이 감지됐습니다"
+
+        if label is None:
+            label = alert_kind
         print(
             f"🔔 {label} | {event['date']} | {event['type']} | "
             f"{start} | {movie} | {screen}"
@@ -725,8 +817,13 @@ def process_event(key, event, seen, booking_state):
         )
         return alerts, soldout_changes
 
-    # 핵심: 매진 -> 다시 예매 가능 = 취소표/좌석 재발생.
+    # 매진 -> 다시 예매 가능 = 취소표 발생.
+    # IMAX / 4DX는 취소표 Discord 알림을 보내지 않고 상태만 갱신한다.
     if previous == "SOLD_OUT" and current == "OPEN":
+        if event.get("type") in {"IMAX", "4DX"}:
+            booking_state[key] = state_record(event, "OPEN")
+            return alerts, soldout_changes
+
         if send_event_alert(event, "REOPEN"):
             booking_state[key] = state_record(event, "OPEN")
             alerts += 1
@@ -1246,7 +1343,7 @@ def main():
     print("EARLY DETECTION: 화면 표시 전이라도 CGV API에 대상 회차/종류가 있으면 추적")
     print("PREPARING: '예매준비중' 문구 또는 cntlYn=Y 감지")
     print("OPEN: 명시적 잔여좌석 > 0")
-    print("REOPEN: 매진 -> 다시 좌석 발생 시 '좌석이 생겼습니다'")
+    print("REOPEN: 매진 -> 다시 좌석 발생 시 '취소표가 생겼습니다'")
     print("FAST SCAN: 매시 00/30분 +4~+21일 18일 / 18 workers 완전 동시")
     print("LOG MODE: 기준값/첫확인 진행 + 정상 감시는 10분 요약")
     print("RUN SECONDS:", RUN_SECONDS)
