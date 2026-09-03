@@ -881,6 +881,35 @@ def send_event_alert_group(events, alert_kind):
     return sent_any
 
 
+def _semantic_show_identity(event):
+    """
+    CGV 내부 scnSseq가 재배정되어도 같은 실제 회차를 이어서 본다.
+
+    사용자에게 보이는 회차 기준:
+    날짜 + 종류 + 영화 + 관 + 시작시간
+    """
+    return (
+        clean_text(event.get("date", "")),
+        clean_text(event.get("type", "")),
+        clean_text(event.get("movie", "")),
+        clean_text(event.get("screen", "")),
+        clean_text(event.get("time", "")).replace(":", ""),
+    )
+
+
+def _find_semantic_previous(event, booking_state):
+    target = _semantic_show_identity(event)
+
+    for old_key, record in booking_state.items():
+        if not isinstance(record, dict):
+            continue
+
+        if _semantic_show_identity(record) == target:
+            return old_key, record
+
+    return None, None
+
+
 def _prepare_event_transition(
     key,
     event,
@@ -905,6 +934,23 @@ def _prepare_event_transition(
         booking_state.get(key)
     )
 
+    # CGV가 scnSseq 같은 내부 회차 식별자를 재배정하면
+    # event_key가 달라질 수 있다.
+    # 날짜/종류/영화/관/시작시간이 같은 기존 회차가 있으면
+    # 새 회차가 아니라 동일 회차의 연속 상태로 이어받는다.
+    semantic_previous_key = None
+    if previous_record is None:
+        (
+            semantic_previous_key,
+            semantic_previous_record,
+        ) = _find_semantic_previous(
+            event,
+            booking_state,
+        )
+
+        if semantic_previous_record is not None:
+            previous_record = semantic_previous_record
+
     previous = (
         previous_record.get(
             "status",
@@ -917,8 +963,12 @@ def _prepare_event_transition(
         else "UNKNOWN"
     )
 
+    # booking_state에 이미 같은 키가 있거나,
+    # 내부키만 바뀐 동일 회차가 확인되면 새 회차로 보지 않는다.
     is_new_key = (
         key not in seen
+        and booking_state.get(key) is None
+        and semantic_previous_key is None
     )
 
     # 새 회차 + 상태 미확인
